@@ -4264,7 +4264,7 @@ fn text_block_svg_class(
             "middle",
             theme,
             fill,
-            false,
+            None,
         );
     };
 
@@ -4283,6 +4283,7 @@ fn text_block_svg_class(
 
     let mut svg = String::new();
     if !title_lines.is_empty() {
+        let bold_idx = title_lines.len().checked_sub(1);
         svg.push_str(&text_lines_svg(
             &title_lines,
             center_x,
@@ -4291,7 +4292,7 @@ fn text_block_svg_class(
             "middle",
             theme,
             fill,
-            true,
+            bold_idx,
         ));
     }
     if !member_lines.is_empty() {
@@ -4303,7 +4304,7 @@ fn text_block_svg_class(
             "start",
             theme,
             fill,
-            false,
+            None,
         ));
     }
     svg
@@ -4367,7 +4368,7 @@ fn render_er_node_label(
             "middle",
             theme,
             fill,
-            true,
+            Some(0),
         ));
         svg.push_str(&format!(
             "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1\" stroke-opacity=\"0.35\"/>",
@@ -4466,7 +4467,7 @@ fn render_er_node_label(
                 "start",
                 theme,
                 fill,
-                false,
+                None,
             ));
         }
     }
@@ -4482,7 +4483,7 @@ fn text_lines_svg(
     anchor: &str,
     theme: &Theme,
     fill: &str,
-    bold_first: bool,
+    bold_line: Option<usize>,
 ) -> String {
     let Some((first_idx, _)) = lines.first() else {
         return String::new();
@@ -4503,7 +4504,7 @@ fn text_lines_svg(
         } else {
             (*idx - prev_idx) as f32 * line_height
         };
-        let weight = if pos == 0 && bold_first {
+        let weight = if bold_line == Some(pos) {
             " font-weight=\"600\""
         } else {
             ""
