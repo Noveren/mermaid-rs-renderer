@@ -363,21 +363,34 @@ fn parse_flowchart(input: &str) -> Result<ParseOutput> {
     Ok(ParseOutput { graph, init_config })
 }
 
+/// Split on `&` that is outside brackets, parens, braces, and quotes.
+fn split_ampersand_aware(input: &str) -> Vec<&str> {
+    let masked = mask_bracket_content(input);
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (i, ch) in masked.char_indices() {
+        if ch == '&' {
+            let part = input[start..i].trim();
+            if !part.is_empty() {
+                parts.push(part);
+            }
+            start = i + 1;
+        }
+    }
+    let last = input[start..].trim();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+    parts
+}
+
 fn add_flowchart_edge(line: &str, graph: &mut Graph, subgraph_stack: &[usize]) -> bool {
     let Some((left, label, right, edge_meta)) = parse_edge_line(line) else {
         return false;
     };
 
-    let sources: Vec<&str> = left
-        .split('&')
-        .map(|part| part.trim())
-        .filter(|part| !part.is_empty())
-        .collect();
-    let targets: Vec<&str> = right
-        .split('&')
-        .map(|part| part.trim())
-        .filter(|part| !part.is_empty())
-        .collect();
+    let sources = split_ampersand_aware(&left);
+    let targets = split_ampersand_aware(&right);
 
     let mut source_ids = Vec::new();
     for source in sources {
@@ -3589,16 +3602,8 @@ fn parse_block_diagram(input: &str) -> Result<ParseOutput> {
             continue;
         }
         if let Some((left, label, right, edge_meta)) = parse_edge_line(line) {
-            let sources: Vec<&str> = left
-                .split('&')
-                .map(|part| part.trim())
-                .filter(|part| !part.is_empty())
-                .collect();
-            let targets: Vec<&str> = right
-                .split('&')
-                .map(|part| part.trim())
-                .filter(|part| !part.is_empty())
-                .collect();
+            let sources = split_ampersand_aware(&left);
+            let targets = split_ampersand_aware(&right);
 
             for source in &sources {
                 let (source_id, source_label, source_shape, source_classes) =
@@ -6052,6 +6057,46 @@ mod tests {
         assert!(parsed.graph.nodes.contains_key("A"));
         assert!(parsed.graph.nodes.contains_key("B"));
         assert!(parsed.graph.nodes.contains_key("C"));
+    }
+
+    #[test]
+    fn parse_ampersand_in_source_label() {
+        let input = r#"flowchart LR
+A["Agent reads artifacts & computes deps"] --> B"#;
+        let parsed = parse_mermaid(input).unwrap();
+        assert_eq!(parsed.graph.edges.len(), 1);
+        assert_eq!(parsed.graph.nodes.len(), 2);
+        assert!(parsed.graph.nodes.contains_key("A"));
+        assert!(parsed.graph.nodes.contains_key("B"));
+        assert_eq!(
+            parsed.graph.nodes["A"].label,
+            "Agent reads artifacts & computes deps"
+        );
+    }
+
+    #[test]
+    fn parse_ampersand_in_target_label() {
+        let input = r#"flowchart LR
+A --> B["List & select changes"]"#;
+        let parsed = parse_mermaid(input).unwrap();
+        assert_eq!(parsed.graph.edges.len(), 1);
+        assert_eq!(parsed.graph.nodes.len(), 2);
+        assert!(parsed.graph.nodes.contains_key("A"));
+        assert!(parsed.graph.nodes.contains_key("B"));
+        assert_eq!(parsed.graph.nodes["B"].label, "List & select changes");
+    }
+
+    #[test]
+    fn parse_parallel_ampersand_with_label_ampersand() {
+        let input = r#"flowchart LR
+A["foo & bar"] & B --> C"#;
+        let parsed = parse_mermaid(input).unwrap();
+        assert_eq!(parsed.graph.edges.len(), 2);
+        assert_eq!(parsed.graph.nodes.len(), 3);
+        assert!(parsed.graph.nodes.contains_key("A"));
+        assert!(parsed.graph.nodes.contains_key("B"));
+        assert!(parsed.graph.nodes.contains_key("C"));
+        assert_eq!(parsed.graph.nodes["A"].label, "foo & bar");
     }
 
     #[test]

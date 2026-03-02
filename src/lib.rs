@@ -388,4 +388,38 @@ mod tests {
         assert!(svg.contains("Dogs"));
         assert!(!svg.contains("Syntax error in text"));
     }
+
+    #[test]
+    fn test_ampersand_in_node_labels_renders_valid_svg() {
+        let svg = render(
+            r#"flowchart LR
+A["Agent reads artifacts & computes deps"] --> B["List & select changes"]"#,
+        )
+        .unwrap();
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("</svg>"));
+        // The `&` should be XML-escaped to `&amp;` in the SVG output
+        assert!(
+            svg.contains("&amp;"),
+            "SVG should contain XML-escaped ampersand"
+        );
+        // The label text may be wrapped across <tspan> elements, so check
+        // that the escaped ampersand appears in the rendered text content.
+        assert!(
+            svg.contains("artifacts &amp;") || svg.contains("artifacts &amp; computes"),
+            "Source label should contain escaped ampersand near 'artifacts'"
+        );
+        assert!(
+            svg.contains("List &amp; select"),
+            "Target label should be intact with escaped ampersand"
+        );
+        // Verify both nodes exist (not split into phantom nodes)
+        // The SVG should have exactly 2 rectangle shapes for the 2 nodes
+        let rect_count = svg.matches("<rect").count();
+        // background rect + 2 node rects = 3
+        assert!(
+            rect_count >= 3,
+            "Expected at least 3 rects (1 bg + 2 nodes), got {rect_count}"
+        );
+    }
 }
