@@ -942,6 +942,19 @@ fn compute_flowchart_layout(
             | crate::ir::DiagramKind::Requirement => 0.0,
             _ => default_stub,
         };
+        let (start_inset, end_inset) = {
+            let s = if edge.arrow_start {
+                crate::render::arrowhead_inset(graph.kind, edge.arrow_start_kind)
+            } else {
+                0.0
+            };
+            let e = if edge.arrow_end {
+                crate::render::arrowhead_inset(graph.kind, edge.arrow_end_kind)
+            } else {
+                0.0
+            };
+            (s, e)
+        };
         let route_ctx = RouteContext {
             from_id: &edge.from,
             to_id: &edge.to,
@@ -958,6 +971,8 @@ fn compute_flowchart_layout(
             start_offset: port_info.start_offset,
             end_offset: port_info.end_offset,
             stub_len,
+            start_inset,
+            end_inset,
         };
         let use_existing_for_edge = !(matches!(
             graph.kind,
@@ -994,6 +1009,8 @@ fn compute_flowchart_layout(
                 start_offset: route_ctx.start_offset,
                 end_offset: route_ctx.end_offset,
                 stub_len: route_ctx.stub_len,
+                start_inset: route_ctx.start_inset,
+                end_inset: route_ctx.end_inset,
             };
             let fast_points = route_edge_with_avoidance(&fast_ctx, None, None, existing_for_edge);
             let fast_hits = path_obstacle_intersections(
@@ -5417,6 +5434,8 @@ mod tests {
             end_offset: 0.0,
             fast_route: false,
             stub_len: port_stub_length(&config, &from, &to),
+            start_inset: 0.0,
+            end_inset: 0.0,
         };
         let mut occupancy = EdgeOccupancy::new(
             config.node_spacing.max(MIN_NODE_SPACING_FLOOR) * EDGE_OCCUPANCY_CELL_RATIO,
@@ -5455,6 +5474,8 @@ mod tests {
             end_offset: 0.0,
             fast_route: false,
             stub_len: port_stub_length(&config, &from, &to),
+            start_inset: 0.0,
+            end_inset: 0.0,
         };
         let points = route_edge_with_avoidance(&ctx, None, None, None);
         assert!(!points.is_empty());
@@ -5477,6 +5498,7 @@ mod tests {
         }];
         let label_obstacles: Vec<Obstacle> = Vec::new();
         let grid = build_routing_grid(&obstacles, &config).expect("routing grid");
+        let stub = port_stub_length(&config, &from, &to);
         let ctx = RouteContext {
             from_id: &from.id,
             to_id: &to.id,
@@ -5492,13 +5514,14 @@ mod tests {
             start_offset: 0.0,
             end_offset: 0.0,
             fast_route: false,
-            stub_len: port_stub_length(&config, &from, &to),
+            stub_len: stub,
+            start_inset: 0.0,
+            end_inset: 0.0,
         };
         let start = anchor_point_for_node(&from, EdgeSide::Right, 0.0);
         let end = anchor_point_for_node(&to, EdgeSide::Left, 0.0);
-        let stub_len = port_stub_length(&config, &from, &to);
-        let start_stub = port_stub_point(start, EdgeSide::Right, stub_len);
-        let end_stub = port_stub_point(end, EdgeSide::Left, stub_len);
+        let start_stub = port_stub_point(start, EdgeSide::Right, stub);
+        let end_stub = port_stub_point(end, EdgeSide::Left, stub);
         let points =
             route_edge_with_grid(&ctx, &grid, None, start_stub, end_stub).expect("grid route");
         let hits = path_obstacle_intersections(&points, &obstacles, &from.id, &to.id);
