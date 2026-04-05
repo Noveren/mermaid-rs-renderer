@@ -48,6 +48,7 @@ use crate::text_metrics;
 use crate::theme::{Theme, adjust_color, parse_color_to_hsl};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 // Label placement padding (resolved per diagram kind).
@@ -206,11 +207,17 @@ pub fn compute_layout_with_metrics(
     };
 
     // Final pass: resolve all edge label positions using collision avoidance.
+
+    #[cfg(not(target_arch = "wasm32"))]
     let label_start = Instant::now();
     label_placement::resolve_all_label_positions(&mut layout, theme, config);
-    stage_metrics.label_placement_us = stage_metrics
-        .label_placement_us
-        .saturating_add(label_start.elapsed().as_micros());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        stage_metrics.label_placement_us = stage_metrics
+            .label_placement_us
+            .saturating_add(label_start.elapsed().as_micros());
+    }
 
     (layout, stage_metrics)
 }
@@ -241,7 +248,7 @@ fn compute_flowchart_layout(
     graph: &Graph,
     theme: &Theme,
     config: &LayoutConfig,
-    mut stage_metrics: Option<&mut LayoutStageMetrics>,
+    #[allow(unused, unused_mut)] mut stage_metrics: Option<&mut LayoutStageMetrics>,
 ) -> Layout {
     let mut effective_config = config.clone();
     if graph.kind == crate::ir::DiagramKind::Requirement {
@@ -509,6 +516,8 @@ fn compute_flowchart_layout(
     } else {
         None
     };
+
+    #[cfg(not(target_arch = "wasm32"))]
     let port_assignment_start = Instant::now();
     let mut node_degrees: HashMap<String, usize> = HashMap::new();
     for edge in &graph.edges {
@@ -713,12 +722,14 @@ fn compute_flowchart_layout(
             }
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(metrics) = stage_metrics.as_deref_mut() {
         metrics.port_assignment_us = metrics
             .port_assignment_us
             .saturating_add(port_assignment_start.elapsed().as_micros());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     let edge_routing_start = Instant::now();
     let pair_counts = build_edge_pair_counts(&graph.edges);
     let mut pair_seen: HashMap<(String, String), usize> = HashMap::new();
@@ -1091,6 +1102,7 @@ fn compute_flowchart_layout(
             insert_label_via_point(points, (cx, cy), graph.direction);
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(metrics) = stage_metrics.as_deref_mut() {
         metrics.edge_routing_us = metrics
             .edge_routing_us
