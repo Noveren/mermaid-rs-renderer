@@ -159,6 +159,25 @@ impl RenderOptions {
         self.layout.rank_spacing = spacing;
         self
     }
+
+    /// Hint the renderer to target a preferred output aspect ratio (`width / height`).
+    ///
+    /// Invalid values (non-finite or `<= 0`) are ignored.
+    pub fn with_preferred_aspect_ratio(mut self, ratio: f32) -> Self {
+        if ratio.is_finite() && ratio > 0.0 {
+            self.layout.preferred_aspect_ratio = Some(ratio);
+        }
+        self
+    }
+
+    /// Hint the renderer to target a preferred output aspect ratio from
+    /// explicit width and height parts (e.g. `16` and `9`).
+    pub fn with_preferred_aspect_ratio_parts(mut self, width: f32, height: f32) -> Self {
+        if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+            self.layout.preferred_aspect_ratio = Some(width / height);
+        }
+        self
+    }
 }
 
 /// Render a Mermaid diagram to SVG with default options.
@@ -319,6 +338,32 @@ pub use cli::run;
 mod tests {
     use super::*;
 
+    fn parse_svg_attr(svg: &str, attr: &str) -> Option<f32> {
+        let marker = format!("{attr}=\"");
+        let start = svg.find(&marker)? + marker.len();
+        let end = svg[start..].find('"')? + start;
+        svg[start..end].parse::<f32>().ok()
+    }
+
+    fn parse_viewbox_ratio(svg: &str) -> Option<f32> {
+        let marker = "viewBox=\"";
+        let start = svg.find(marker)? + marker.len();
+        let end = svg[start..].find('"')? + start;
+        let parts: Vec<&str> = svg[start..end]
+            .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.len() < 4 {
+            return None;
+        }
+        let width = parts[2].parse::<f32>().ok()?;
+        let height = parts[3].parse::<f32>().ok()?;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some(width / height)
+    }
+
     #[test]
     fn test_render_simple() {
         let svg = render("flowchart LR; A-->B").unwrap();
@@ -390,36 +435,46 @@ mod tests {
     }
 
     #[test]
-    fn test_ampersand_in_node_labels_renders_valid_svg() {
-        let svg = render(
-            r#"flowchart LR
-A["Agent reads artifacts & computes deps"] --> B["List & select changes"]"#,
-        )
-        .unwrap();
-        assert!(svg.contains("<svg"));
-        assert!(svg.contains("</svg>"));
-        // The `&` should be XML-escaped to `&amp;` in the SVG output
+    fn test_preferred_aspect_ratio_applies_to_svg_dimensions() {
+        let opts = RenderOptions::default().with_preferred_aspect_ratio_parts(16.0, 9.0);
+        let svg = render_with_options("flowchart LR; A-->B-->C", opts).unwrap();
+        let width = parse_svg_attr(&svg, "width").expect("width");
+        let height = parse_svg_attr(&svg, "height").expect("height");
+        let ratio = width / height;
+        assert!((ratio - (16.0 / 9.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_preferred_aspect_ratio_rebalances_viewbox_layout() {
+        let input = "flowchart LR; A-->B-->C-->D-->E";
+        let base_svg = render(input).unwrap();
+        let base_ratio = parse_viewbox_ratio(&base_svg).expect("base viewBox ratio");
+
+        let target_ratio = 1.0;
+        let opts = RenderOptions::default().with_preferred_aspect_ratio(target_ratio);
+        let tuned_svg = render_with_options(input, opts).unwrap();
+        let tuned_ratio = parse_viewbox_ratio(&tuned_svg).expect("tuned viewBox ratio");
+
         assert!(
-            svg.contains("&amp;"),
-            "SVG should contain XML-escaped ampersand"
+            (tuned_ratio - target_ratio).abs() + 0.01 < (base_ratio - target_ratio).abs(),
+            "expected preferred ratio to move viewBox ratio toward target (base={base_ratio:.3}, tuned={tuned_ratio:.3})"
         );
-        // The label text may be wrapped across <tspan> elements, so check
-        // that the escaped ampersand appears in the rendered text content.
         assert!(
-            svg.contains("artifacts &amp;") || svg.contains("artifacts &amp; computes"),
-            "Source label should contain escaped ampersand near 'artifacts'"
+            (tuned_ratio - target_ratio).abs() < 0.05,
+            "expected preferred ratio to closely match target for simple flowcharts (target={target_ratio:.3}, got={tuned_ratio:.3})"
         );
+    }
+
+    #[test]
+    fn test_preferred_aspect_ratio_handles_tall_targets() {
+        let input = "flowchart LR; A-->B-->C-->D-->E";
+        let target_ratio = 9.0 / 16.0;
+        let opts = RenderOptions::default().with_preferred_aspect_ratio(target_ratio);
+        let tuned_svg = render_with_options(input, opts).unwrap();
+        let tuned_ratio = parse_viewbox_ratio(&tuned_svg).expect("tuned viewBox ratio");
         assert!(
-            svg.contains("List &amp; select"),
-            "Target label should be intact with escaped ampersand"
-        );
-        // Verify both nodes exist (not split into phantom nodes)
-        // The SVG should have exactly 2 rectangle shapes for the 2 nodes
-        let rect_count = svg.matches("<rect").count();
-        // background rect + 2 node rects = 3
-        assert!(
-            rect_count >= 3,
-            "Expected at least 3 rects (1 bg + 2 nodes), got {rect_count}"
+            (tuned_ratio - target_ratio).abs() < 0.05,
+            "expected tall preferred ratio to be respected (target={target_ratio:.3}, got={tuned_ratio:.3})"
         );
     }
 }

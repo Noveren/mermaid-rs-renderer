@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import datetime
+import getpass
 import importlib.util
 import json
 import math
+import platform
 import re
+import socket
 import statistics
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -20,33 +25,65 @@ ROOT = Path(__file__).resolve().parents[1]
 # Fallback only; default scoring derives weights programmatically from fixture data.
 MANUAL_WEIGHTS = {
     "edge_crossings": 8.0,
+    "edge_crossings_per_edge": 12.0,
     "edge_node_crossings": 10.0,
+    "edge_node_crossing_length_per_edge": 0.8,
+    "subgraph_boundary_intrusion_ratio": 26.0,
+    "subgraph_boundary_intrusion_length_per_edge": 0.6,
     "node_overlap_count": 12.0,
     "edge_bends": 1.5,
     "port_congestion": 2.5,
+    "port_target_side_mismatch_ratio": 30.0,
+    "port_direction_misalignment_ratio": 24.0,
+    "endpoint_off_boundary_ratio": 45.0,
+    "parallel_edge_overlap_ratio_mean": 28.0,
+    "parallel_edge_separation_bad_ratio": 26.0,
+    "flow_backtrack_ratio": 42.0,
+    "flow_backtracking_edge_ratio": 24.0,
     "edge_overlap_length": 1.0,
     "edge_detour_penalty": 35.0,
     "space_efficiency_penalty": 260.0,
+    "wasted_space_large_ratio": 320.0,
+    "space_efficiency_large_penalty": 340.0,
+    "component_gap_large_ratio": 200.0,
     "margin_imbalance_ratio": 130.0,
     "edge_length_per_node": 0.4,
+    "edge_label_owned_path_too_close_ratio": 52.0,
+    "edge_label_owned_path_optimal_gap_penalty": 46.0,
+    "edge_label_owned_path_gap_bad_ratio": 34.0,
+    "edge_label_owned_mapping_ratio": 18.0,
 }
 
 DEFAULT_PRIORITY_METRICS = [
     "edge_crossings",
+    "edge_crossings_per_edge",
     "edge_node_crossings",
+    "edge_node_crossing_length_per_edge",
+    "subgraph_boundary_intrusion_ratio",
+    "subgraph_boundary_intrusion_length_per_edge",
     "node_overlap_count",
     "edge_bends",
     "crossing_angle_penalty",
     "angular_resolution_penalty",
     "port_congestion",
+    "port_target_side_mismatch_ratio",
+    "port_direction_misalignment_ratio",
+    "endpoint_off_boundary_ratio",
+    "parallel_edge_overlap_ratio_mean",
+    "parallel_edge_separation_bad_ratio",
+    "flow_backtrack_ratio",
+    "flow_backtracking_edge_ratio",
     "edge_overlap_length",
     "edge_node_near_miss_count",
     "node_spacing_violation_severity",
     "edge_detour_penalty",
     "wasted_space_ratio",
     "space_efficiency_penalty",
+    "wasted_space_large_ratio",
+    "space_efficiency_large_penalty",
     "margin_imbalance_ratio",
     "component_gap_ratio",
+    "component_gap_large_ratio",
     "component_balance_penalty",
     "content_center_offset_ratio",
     "content_aspect_elongation",
@@ -59,6 +96,12 @@ DEFAULT_PRIORITY_METRICS = [
     "label_out_of_bounds_count",
     "label_out_of_bounds_area",
     "label_out_of_bounds_ratio",
+    "edge_label_owned_path_too_close_ratio",
+    "edge_label_owned_path_optimal_gap_penalty",
+    "edge_label_owned_path_gap_bad_ratio",
+    "edge_label_owned_anchor_offset_bad_ratio",
+    "edge_label_owned_anchor_offset_px_mean",
+    "edge_label_owned_mapping_ratio",
 ]
 
 
@@ -84,6 +127,47 @@ def load_quality_bench():
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def iso_utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def git_metadata() -> dict[str, Any]:
+    def git(args: list[str]) -> str:
+        res = run(["git"] + args)
+        if res.returncode != 0:
+            return ""
+        return res.stdout.strip()
+
+    commit = git(["rev-parse", "HEAD"])
+    short = commit[:12] if commit else ""
+    branch = git(["rev-parse", "--abbrev-ref", "HEAD"])
+    describe = git(["describe", "--always", "--dirty", "--tags"])
+    status = git(["status", "--porcelain"])
+    return {
+        "commit": commit,
+        "commit_short": short,
+        "branch": branch,
+        "describe": describe,
+        "dirty": bool(status),
+    }
+
+
+def host_metadata() -> dict[str, str]:
+    return {
+        "hostname": socket.gethostname(),
+        "user": getpass.getuser(),
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+    }
+
+
+def append_benchmark_history(history_path: Path, record: dict[str, Any]) -> None:
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    with history_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True))
+        handle.write("\n")
 
 
 def resolve_bin(path_str: str) -> Path:
@@ -350,7 +434,24 @@ def benchmark_fixture(
         metrics = layout_score_mod.compute_metrics(data, nodes, edges)
         metrics["score"] = layout_score_mod.weighted_score(metrics)
         try:
-            label_metrics = quality_bench_mod.compute_label_metrics(svg_path, nodes, edges)
+            diagram_kind = quality_bench_mod.detect_diagram_kind(fixture)
+            allow_fallback_labels = quality_bench_mod.fixture_has_edge_label(
+                fixture, diagram_kind
+            )
+            expected_sequence_labels = (
+                quality_bench_mod.expected_sequence_label_count(fixture)
+                if diagram_kind == "sequence"
+                else None
+            )
+            _, _, svg_edges = quality_bench_mod.load_mermaid_svg_graph(svg_path)
+            label_metrics = quality_bench_mod.compute_label_metrics(
+                svg_path,
+                nodes,
+                svg_edges,
+                diagram_kind=diagram_kind,
+                allow_fallback_candidates=allow_fallback_labels,
+                expected_edge_label_count=expected_sequence_labels,
+            )
             metrics.update(label_metrics)
         except Exception:
             # Keep benchmark resilient if label parsing fails on a fixture.
@@ -391,6 +492,7 @@ def print_priorities(results: list[dict[str, Any]], top_n: int) -> None:
             f"pain={priority['pain_score']:.3f}  "
             f"layout={timing['layout_ms']:.2f}ms  "
             f"cross={metrics['edge_crossings']}  "
+            f"cross/edge={metrics.get('edge_crossings_per_edge', 0.0):.2f}  "
             f"edge-node={metrics['edge_node_crossings']}  "
             f"overlap={metrics['node_overlap_count']}  "
             f"bends={metrics['edge_bends']}  "
@@ -398,8 +500,14 @@ def print_priorities(results: list[dict[str, Any]], top_n: int) -> None:
             f"lbl-overlap={metrics.get('label_overlap_count', 0)}  "
             f"lbl-edge={metrics.get('label_edge_overlap_count', 0)}  "
             f"lbl-oob={metrics.get('label_out_of_bounds_count', 0)}  "
+            f"lbl-owned-too-close={metrics.get('edge_label_owned_path_too_close_ratio', 0.0):.2f}  "
+            f"lbl-owned-opt={metrics.get('edge_label_owned_path_optimal_gap_score_mean', 0.0):.2f}  "
+            f"lbl-owned-map={metrics.get('edge_label_owned_mapping_ratio', 0.0):.2f}  "
             f"waste={metrics.get('wasted_space_ratio', 0.0):.2f}  "
+            f"waste-large={metrics.get('wasted_space_large_ratio', 0.0):.2f}  "
             f"comp-gap={metrics.get('component_gap_ratio', 0.0):.2f}  "
+            f"comp-gap-large={metrics.get('component_gap_large_ratio', 0.0):.2f}  "
+            f"space-large-w={metrics.get('large_diagram_space_weight', 0.0):.2f}  "
             f"fill={metrics.get('content_fill_ratio', 0.0):.2f}  "
             f"detour={metrics.get('avg_edge_detour_ratio', 1.0):.2f}"
         )
@@ -419,13 +527,40 @@ def print_priorities(results: list[dict[str, Any]], top_n: int) -> None:
     by_space = sorted(
         ok,
         key=lambda entry: (
-            safe_num(entry["metrics"].get("wasted_space_ratio", 0.0))
-            + safe_num(entry["metrics"].get("component_gap_ratio", 0.0))
+            safe_num(entry["metrics"].get("wasted_space_large_ratio", 0.0))
+            + safe_num(entry["metrics"].get("space_efficiency_large_penalty", 0.0))
+            + safe_num(entry["metrics"].get("component_gap_large_ratio", 0.0))
             + safe_num(entry["metrics"].get("content_center_offset_ratio", 0.0))
             + safe_num(entry["metrics"].get("content_overflow_ratio", 0.0))
         ),
         reverse=True,
     )
+    print()
+    print(f"Top {top_n} by large-diagram unused space:")
+    by_large_space = sorted(
+        ok,
+        key=lambda entry: (
+            safe_num(entry["metrics"].get("wasted_space_large_ratio", 0.0))
+            + safe_num(entry["metrics"].get("space_efficiency_large_penalty", 0.0))
+            + safe_num(entry["metrics"].get("component_gap_large_ratio", 0.0))
+        ),
+        reverse=True,
+    )
+    for idx, item in enumerate(by_large_space[:top_n], start=1):
+        metrics = item["metrics"]
+        timing = item["timing"]
+        print(
+            f"{idx}. {item['fixture']}  "
+            f"large-space={safe_num(metrics.get('wasted_space_large_ratio', 0.0)) + safe_num(metrics.get('space_efficiency_large_penalty', 0.0)) + safe_num(metrics.get('component_gap_large_ratio', 0.0)):.3f}  "
+            f"wasted-large={metrics.get('wasted_space_large_ratio', 0.0):.3f}  "
+            f"space-pen-large={metrics.get('space_efficiency_large_penalty', 0.0):.3f}  "
+            f"comp-gap-large={metrics.get('component_gap_large_ratio', 0.0):.3f}  "
+            f"large-w={metrics.get('large_diagram_space_weight', 0.0):.2f}  "
+            f"raw-wasted={metrics.get('wasted_space_ratio', 0.0):.2f}  "
+            f"fill={metrics.get('content_fill_ratio', 0.0):.2f}  "
+            f"layout={timing['layout_ms']:.2f}ms"
+        )
+
     print()
     print(f"Top {top_n} by space inefficiency:")
     for idx, item in enumerate(by_space[:top_n], start=1):
@@ -433,11 +568,14 @@ def print_priorities(results: list[dict[str, Any]], top_n: int) -> None:
         timing = item["timing"]
         print(
             f"{idx}. {item['fixture']}  "
-            f"space_stress={safe_num(metrics.get('wasted_space_ratio', 0.0)) + safe_num(metrics.get('component_gap_ratio', 0.0)) + safe_num(metrics.get('content_center_offset_ratio', 0.0)) + safe_num(metrics.get('content_overflow_ratio', 0.0)):.3f}  "
-            f"wasted={metrics.get('wasted_space_ratio', 0.0):.2f}  "
-            f"comp-gap={metrics.get('component_gap_ratio', 0.0):.2f}  "
+            f"space_stress={safe_num(metrics.get('wasted_space_large_ratio', 0.0)) + safe_num(metrics.get('space_efficiency_large_penalty', 0.0)) + safe_num(metrics.get('component_gap_large_ratio', 0.0)) + safe_num(metrics.get('content_center_offset_ratio', 0.0)) + safe_num(metrics.get('content_overflow_ratio', 0.0)):.3f}  "
+            f"wasted-large={metrics.get('wasted_space_large_ratio', 0.0):.2f}  "
+            f"space-pen-large={metrics.get('space_efficiency_large_penalty', 0.0):.2f}  "
+            f"comp-gap-large={metrics.get('component_gap_large_ratio', 0.0):.2f}  "
             f"center={metrics.get('content_center_offset_ratio', 0.0):.2f}  "
             f"overflow={metrics.get('content_overflow_ratio', 0.0):.2f}  "
+            f"large-w={metrics.get('large_diagram_space_weight', 0.0):.2f}  "
+            f"wasted={metrics.get('wasted_space_ratio', 0.0):.2f}  "
             f"fill={metrics.get('content_fill_ratio', 0.0):.2f}  "
             f"imbalance={metrics.get('margin_imbalance_ratio', 0.0):.2f}  "
             f"layout={timing['layout_ms']:.2f}ms"
@@ -448,6 +586,47 @@ def print_priorities(results: list[dict[str, Any]], top_n: int) -> None:
         print("Failures:")
         for item in failed:
             print(f"- {item['fixture']}: {item['error']}")
+
+
+def summarize_priority_history(results: list[dict[str, Any]]) -> dict[str, Any]:
+    ok = [entry for entry in results if "error" not in entry]
+    failed = [entry for entry in results if "error" in entry]
+
+    pain_scores = [safe_num(entry.get("priority", {}).get("pain_score", 0.0)) for entry in ok]
+    roi_scores = [safe_num(entry.get("priority", {}).get("pain_per_layout_ms", 0.0)) for entry in ok]
+    layout_ms = [safe_num(entry.get("timing", {}).get("layout_ms", 0.0)) for entry in ok]
+
+    top_pain = max(
+        ok,
+        key=lambda entry: safe_num(entry.get("priority", {}).get("pain_score", 0.0)),
+        default=None,
+    )
+    top_roi = max(
+        ok,
+        key=lambda entry: safe_num(entry.get("priority", {}).get("pain_per_layout_ms", 0.0)),
+        default=None,
+    )
+
+    pain_p95 = 0.0
+    if pain_scores:
+        if len(pain_scores) == 1:
+            pain_p95 = pain_scores[0]
+        else:
+            pain_p95 = statistics.quantiles(pain_scores, n=20, method="inclusive")[18]
+
+    return {
+        "fixture_count": len(results),
+        "success_count": len(ok),
+        "failure_count": len(failed),
+        "pain_score_mean": statistics.mean(pain_scores) if pain_scores else 0.0,
+        "pain_score_p95": pain_p95,
+        "pain_per_layout_ms_mean": statistics.mean(roi_scores) if roi_scores else 0.0,
+        "layout_ms_mean": statistics.mean(layout_ms) if layout_ms else 0.0,
+        "top_pain_fixture": top_pain.get("fixture") if top_pain else "",
+        "top_pain_score": safe_num(top_pain.get("priority", {}).get("pain_score", 0.0)) if top_pain else 0.0,
+        "top_roi_fixture": top_roi.get("fixture") if top_roi else "",
+        "top_roi_score": safe_num(top_roi.get("priority", {}).get("pain_per_layout_ms", 0.0)) if top_roi else 0.0,
+    }
 
 
 def main() -> None:
@@ -496,6 +675,16 @@ def main() -> None:
         "--output-json",
         default=str(ROOT / "target" / "priority-bench.json"),
         help="Path for machine-readable report JSON",
+    )
+    parser.add_argument(
+        "--history-log",
+        default=str(ROOT / "tmp" / "benchmark-history" / "priority-runs.jsonl"),
+        help="Path to append benchmark run history JSONL",
+    )
+    parser.add_argument(
+        "--no-history-log",
+        action="store_true",
+        help="disable benchmark history JSONL logging for this run",
     )
     args = parser.parse_args()
 
@@ -547,6 +736,33 @@ def main() -> None:
     print_priorities(results, top_n=max(args.top, 1))
     print()
     print(f"Wrote {output_path}")
+
+    if not args.no_history_log:
+        history_path = Path(args.history_log)
+        record = {
+            "timestamp_utc": iso_utc_now(),
+            "history_version": 1,
+            "tool": "priority_bench",
+            "cwd": str(ROOT),
+            "argv": sys.argv[1:],
+            "git": git_metadata(),
+            "host": host_metadata(),
+            "settings": {
+                "bin": str(bin_path),
+                "config": str(config_path),
+                "runs": args.runs,
+                "warmup": args.warmup,
+                "weight_mode": args.weight_mode,
+                "metrics_requested": metric_keys,
+                "patterns": args.pattern,
+                "fixture_roots": [str(path) for path in fixture_roots],
+                "fixture_limit": args.limit,
+                "output_json": str(output_path),
+            },
+            "summary": summarize_priority_history(results),
+        }
+        append_benchmark_history(history_path, record)
+        print(f"Wrote history: {history_path}")
 
 
 if __name__ == "__main__":

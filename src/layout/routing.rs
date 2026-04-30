@@ -35,6 +35,8 @@ const PORT_STUB_MAX: f32 = 22.0;
 const ROUTING_CELL_RATIO: f32 = 0.35;
 /// Minimum routing cell size.
 const ROUTING_CELL_MIN: f32 = 8.0;
+/// Fallback routing cell scale when fine grid paths remain obstructed.
+const ROUTING_CELL_FALLBACK_SCALE: f32 = 1.45;
 /// Minimum node spacing used to compute grid margin.
 const GRID_MARGIN_MIN_SPACING: f32 = 24.0;
 
@@ -65,6 +67,20 @@ const OVERLAP_TRIGGER_RATIO: f32 = 0.35;
 const OVERLAP_TRIGGER_MIN: f32 = 4.0;
 /// Minimum collinear overlap length (px) that should trigger extra detour search.
 const OVERLAP_DETOUR_MIN: f32 = 3.0;
+/// Path-length epsilon used when preferring shorter routes in tie-breaks.
+const ROUTE_LENGTH_TIE_EPS: f32 = 2.0;
+/// Tie-break epsilon for path distance to the preferred label center.
+const ROUTE_VIA_TIE_EPS: f32 = 0.4;
+/// Soft clearance around node/subgraph obstacles used when scoring candidates.
+const ROUTE_SOFT_NODE_CLEARANCE: f32 = 3.0;
+/// Soft clearance around label obstacles used when scoring candidates.
+const ROUTE_SOFT_LABEL_CLEARANCE: f32 = 4.0;
+/// Soft clearance against already-routed edge segments.
+const ROUTE_SOFT_EDGE_CLEARANCE: f32 = 4.0;
+/// Extra weight for an edge cutting through its own reserved label corridor.
+const ROUTE_OWN_LABEL_HARD_WEIGHT: usize = 6;
+/// Extra weight for an edge running too close to its own reserved label corridor.
+const ROUTE_OWN_LABEL_NEAR_WEIGHT: usize = 3;
 
 // ── Label obstacle padding ──────────────────────────────────────────
 /// Padding around node labels when building label obstacles.
@@ -78,6 +94,12 @@ pub(super) enum EdgeSide {
     Right,
     Top,
     Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum PortAxis {
+    X,
+    Y,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +133,14 @@ pub(super) fn is_horizontal(direction: Direction) -> bool {
 
 pub(super) fn side_is_vertical(side: EdgeSide) -> bool {
     matches!(side, EdgeSide::Left | EdgeSide::Right)
+}
+
+pub(super) fn port_axis(side: EdgeSide) -> PortAxis {
+    if side_is_vertical(side) {
+        PortAxis::Y
+    } else {
+        PortAxis::X
+    }
 }
 
 pub(super) fn edge_sides(
@@ -196,11 +226,25 @@ pub(super) fn edge_sides_balanced(
     from: &NodeLayout,
     to: &NodeLayout,
     allow_low_degree_balancing: bool,
+    prefer_outer_sides: bool,
     direction: Direction,
     node_degrees: &HashMap<String, usize>,
     side_loads: &HashMap<String, [usize; 4]>,
 ) -> (EdgeSide, EdgeSide, bool) {
     let primary = edge_sides(from, to, direction);
+    if prefer_outer_sides {
+        return if is_horizontal(direction) {
+            if (to.y + to.height / 2.0) >= (from.y + from.height / 2.0) {
+                (EdgeSide::Bottom, EdgeSide::Bottom, primary.2)
+            } else {
+                (EdgeSide::Top, EdgeSide::Top, primary.2)
+            }
+        } else if (to.x + to.width / 2.0) >= (from.x + from.width / 2.0) {
+            (EdgeSide::Right, EdgeSide::Right, primary.2)
+        } else {
+            (EdgeSide::Left, EdgeSide::Left, primary.2)
+        };
+    }
     let from_degree = node_degrees.get(from_id).copied().unwrap_or(0);
     let to_degree = node_degrees.get(to_id).copied().unwrap_or(0);
     if from_degree < 6 && to_degree < 6 {
@@ -209,7 +253,7 @@ pub(super) fn edge_sides_balanced(
         }
         let primary_load = side_load_for_node(side_loads, from_id, primary.0)
             + side_load_for_node(side_loads, to_id, primary.1);
-        if primary_load < LOW_DEGREE_BALANCE_MIN_PRIMARY_LOAD {
+        if primary_load < LOW_DEGREE_BALANCE_MIN_PRIMARY_LOAD && !prefer_outer_sides {
             return primary;
         }
     }
@@ -311,6 +355,15 @@ pub(super) fn edge_sides_balanced(
         } else {
             5.0
         };
+        let outer_side_penalty = if prefer_outer_sides {
+            if edge_axis_is_horizontal(start_side) == primary_axis {
+                6.5
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
         let primary_penalty = if start_side == primary.0 && end_side == primary.1 {
             0.0
         } else {
@@ -321,6 +374,7 @@ pub(super) fn edge_sides_balanced(
             + overload_penalty
             + manhattan * 0.22
             + axis_penalty
+            + outer_side_penalty
             + primary_penalty
             + backward_penalty;
         let tiebreak = manhattan + from_load + to_load;
@@ -352,6 +406,160 @@ pub(super) struct RouteContext<'a> {
     pub(super) stub_len: f32,
     pub(super) start_inset: f32,
     pub(super) end_inset: f32,
+    pub(super) prefer_shorter_ties: bool,
+    pub(super) preferred_label_id: Option<&'a str>,
+    pub(super) preferred_label_center: Option<(f32, f32)>,
+    pub(super) preferred_label_obstacle: Option<&'a Obstacle>,
+    pub(super) preferred_label_clearance: f32,
+    pub(super) force_preferred_label_via: bool,
+    pub(super) coarse_grid_retry: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct PreferredLabelMetrics {
+    hard_hits: usize,
+    near_hits: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RouteCandidate {
+    points: Vec<(f32, f32)>,
+    hits: usize,
+    own_label: PreferredLabelMetrics,
+    cross: usize,
+    label_hits: usize,
+    overlap: f32,
+    via_dist: f32,
+    bends: usize,
+    len: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RouteCandidateOrderKey {
+    hits: usize,
+    own_label_score: usize,
+    cross: usize,
+    label_hits: usize,
+    overlap: f32,
+    via_dist: f32,
+    bends: usize,
+    len: f32,
+    occupancy_score: Option<u32>,
+}
+
+fn expand_obstacle(obstacle: &Obstacle, pad: f32) -> Obstacle {
+    Obstacle {
+        id: obstacle.id.clone(),
+        x: obstacle.x - pad,
+        y: obstacle.y - pad,
+        width: obstacle.width + pad * 2.0,
+        height: obstacle.height + pad * 2.0,
+        members: obstacle.members.clone(),
+    }
+}
+
+fn preferred_label_metrics(points: &[(f32, f32)], ctx: &RouteContext<'_>) -> PreferredLabelMetrics {
+    let Some(obstacle) = ctx.preferred_label_obstacle else {
+        return PreferredLabelMetrics::default();
+    };
+    let hard_hits = path_label_intersections(points, std::slice::from_ref(obstacle), None);
+    let near_hits = path_label_near_intersections(
+        points,
+        std::slice::from_ref(obstacle),
+        None,
+        ctx.preferred_label_clearance.max(0.0),
+    );
+    PreferredLabelMetrics {
+        hard_hits,
+        near_hits,
+    }
+}
+
+fn own_label_score(own_label: PreferredLabelMetrics) -> usize {
+    own_label
+        .hard_hits
+        .saturating_mul(ROUTE_OWN_LABEL_HARD_WEIGHT)
+        .saturating_add(
+            own_label
+                .near_hits
+                .saturating_mul(ROUTE_OWN_LABEL_NEAR_WEIGHT),
+        )
+}
+
+fn route_candidate_key(
+    candidate: &RouteCandidate,
+    occupancy_score: Option<u32>,
+) -> RouteCandidateOrderKey {
+    RouteCandidateOrderKey {
+        hits: candidate.hits,
+        own_label_score: own_label_score(candidate.own_label),
+        cross: candidate.cross,
+        label_hits: candidate.label_hits,
+        overlap: candidate.overlap,
+        via_dist: candidate.via_dist,
+        bends: candidate.bends,
+        len: candidate.len,
+        occupancy_score,
+    }
+}
+
+fn route_candidate_better(
+    ctx: &RouteContext<'_>,
+    candidate: RouteCandidateOrderKey,
+    best: Option<RouteCandidateOrderKey>,
+) -> bool {
+    let Some(best) = best else {
+        return true;
+    };
+    if candidate.hits != best.hits {
+        return candidate.hits < best.hits;
+    }
+    if candidate.own_label_score != best.own_label_score {
+        return candidate.own_label_score < best.own_label_score;
+    }
+    if candidate.cross != best.cross {
+        return candidate.cross < best.cross;
+    }
+    if candidate.label_hits != best.label_hits {
+        return candidate.label_hits < best.label_hits;
+    }
+    if (candidate.overlap - best.overlap).abs() > 1e-4 {
+        return candidate.overlap < best.overlap;
+    }
+    if candidate.via_dist + ROUTE_VIA_TIE_EPS < best.via_dist {
+        return true;
+    }
+    if (candidate.via_dist - best.via_dist).abs() > ROUTE_VIA_TIE_EPS {
+        return false;
+    }
+    if ctx.prefer_shorter_ties {
+        if candidate.len + ROUTE_LENGTH_TIE_EPS < best.len {
+            return true;
+        }
+        if (candidate.len - best.len).abs() > ROUTE_LENGTH_TIE_EPS {
+            return false;
+        }
+        if candidate.occupancy_score != best.occupancy_score
+            && let (Some(score), Some(best_score)) =
+                (candidate.occupancy_score, best.occupancy_score)
+            && score != best_score
+        {
+            return score < best_score;
+        }
+        candidate.bends < best.bends
+    } else {
+        if candidate.bends != best.bends {
+            return candidate.bends < best.bends;
+        }
+        if candidate.occupancy_score != best.occupancy_score
+            && let (Some(score), Some(best_score)) =
+                (candidate.occupancy_score, best.occupancy_score)
+            && score != best_score
+        {
+            return score < best_score;
+        }
+        candidate.len < best.len
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -856,6 +1064,22 @@ pub(super) fn build_routing_grid(
     RoutingGrid::new(obstacles, cell, margin, max_cells)
 }
 
+fn build_fallback_routing_grid(
+    obstacles: &[Obstacle],
+    config: &LayoutConfig,
+    base_cell: f32,
+) -> Option<RoutingGrid> {
+    let fallback_cell = (base_cell * ROUTING_CELL_FALLBACK_SCALE)
+        .max(base_cell + 2.0)
+        .max(ROUTING_CELL_MIN);
+    if fallback_cell <= base_cell + 0.5 {
+        return None;
+    }
+    let margin = config.node_spacing.max(GRID_MARGIN_MIN_SPACING) * 2.0;
+    let max_cells = (config.flowchart.routing.max_steps / 14).max(3000);
+    RoutingGrid::new(obstacles, fallback_cell, margin, max_cells)
+}
+
 pub(super) fn cell_blocked(
     grid: &RoutingGrid,
     obstacles: &[Obstacle],
@@ -882,6 +1106,16 @@ pub(super) fn cell_blocked(
             return true;
         }
     }
+    if let Some(obstacle) = ctx.preferred_label_obstacle {
+        let expanded = expand_obstacle(obstacle, ctx.preferred_label_clearance.max(0.0));
+        if cx >= expanded.x
+            && cx <= expanded.x + expanded.width
+            && cy >= expanded.y
+            && cy <= expanded.y + expanded.height
+        {
+            return true;
+        }
+    }
     false
 }
 
@@ -891,32 +1125,43 @@ pub(super) fn cell_blocked(
 pub(super) fn insert_label_via_point(
     points: &mut Vec<(f32, f32)>,
     via: (f32, f32),
-    direction: Direction,
+    _direction: Direction,
 ) {
     if points.len() < 2 {
         return;
     }
-    let main = |p: (f32, f32)| -> f32 { if is_horizontal(direction) { p.0 } else { p.1 } };
-    let via_main = main(via);
-    // Find the first segment where the via-point's main-axis coordinate
-    // falls between the two endpoints.
+    if polyline_point_distance(points, via) <= 0.6 {
+        return;
+    }
+    // Insert on the segment that minimizes extra path length, which keeps
+    // the routed path stable and avoids large detours from axis-only matching.
+    let mut best_idx = None;
+    let mut best_delta = f32::INFINITY;
     for i in 1..points.len() {
-        let a_main = main(points[i - 1]);
-        let b_main = main(points[i]);
-        let lo = a_main.min(b_main);
-        let hi = a_main.max(b_main);
-        if via_main >= lo - 1.0 && via_main <= hi + 1.0 {
-            // Don't insert if very close to an existing point.
-            let dist_a =
-                ((via.0 - points[i - 1].0).powi(2) + (via.1 - points[i - 1].1).powi(2)).sqrt();
-            let dist_b = ((via.0 - points[i].0).powi(2) + (via.1 - points[i].1).powi(2)).sqrt();
-            if dist_a > 2.0 && dist_b > 2.0 {
-                points.insert(i, via);
-            }
-            return;
+        let a = points[i - 1];
+        let b = points[i];
+        let base_len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+        if base_len <= 1e-4 {
+            continue;
+        }
+        let via_len_a = ((via.0 - a.0).powi(2) + (via.1 - a.1).powi(2)).sqrt();
+        let via_len_b = ((via.0 - b.0).powi(2) + (via.1 - b.1).powi(2)).sqrt();
+        let delta = (via_len_a + via_len_b - base_len).max(0.0);
+        if delta < best_delta {
+            best_delta = delta;
+            best_idx = Some(i);
         }
     }
-    // Fallback: insert at the midpoint of the path (by index).
+
+    if let Some(i) = best_idx {
+        let dist_a = ((via.0 - points[i - 1].0).powi(2) + (via.1 - points[i - 1].1).powi(2)).sqrt();
+        let dist_b = ((via.0 - points[i].0).powi(2) + (via.1 - points[i].1).powi(2)).sqrt();
+        if dist_a > 2.0 && dist_b > 2.0 {
+            points.insert(i, via);
+        }
+        return;
+    }
+
     let mid = points.len() / 2;
     points.insert(mid, via);
 }
@@ -943,7 +1188,12 @@ pub(super) fn compress_path(points: &[(f32, f32)]) -> Vec<(f32, f32)> {
         let dx2 = next.0 - curr.0;
         let dy2 = next.1 - curr.1;
         if (dx1.abs() <= 1e-4 && dx2.abs() <= 1e-4) || (dy1.abs() <= 1e-4 && dy2.abs() <= 1e-4) {
-            continue;
+            // Keep explicit reversal points (U-turns). They are needed when
+            // forcing a route through a reserved label center.
+            let dot = dx1 * dx2 + dy1 * dy2;
+            if dot >= 0.0 {
+                continue;
+            }
         }
         out.push(curr);
     }
@@ -974,11 +1224,30 @@ pub(super) fn route_edge_with_grid(
 
     let dirs: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
     let step_cost = (grid.cell * ASTAR_COST_SCALE).round() as u32;
+    let manhattan_cells = (end_ix - start_ix).abs() + (end_iy - start_iy).abs();
+    let turn_scale = if manhattan_cells <= 8 {
+        0.85
+    } else if manhattan_cells >= 42 {
+        1.35
+    } else {
+        0.85 + (manhattan_cells as f32 - 8.0) * (0.50 / 34.0)
+    };
+    let occupancy_scale = if manhattan_cells <= 10 {
+        0.90
+    } else if manhattan_cells >= 36 {
+        0.60
+    } else {
+        0.90 - (manhattan_cells as f32 - 10.0) * (0.30 / 26.0)
+    };
     let turn_penalty =
-        (ctx.config.flowchart.routing.turn_penalty * grid.cell * ASTAR_COST_SCALE).round() as u32;
-    let occupancy_weight =
-        (ctx.config.flowchart.routing.occupancy_weight * grid.cell * ASTAR_COST_SCALE).round()
-            as u32;
+        (ctx.config.flowchart.routing.turn_penalty * turn_scale * grid.cell * ASTAR_COST_SCALE)
+            .round() as u32;
+    let occupancy_weight = ((ctx.config.flowchart.routing.occupancy_weight
+        * occupancy_scale
+        * grid.cell
+        * ASTAR_COST_SCALE)
+        .round() as u32)
+        .max(1);
     let max_steps = ctx.config.flowchart.routing.max_steps.max(10_000);
 
     let cols = grid.cols;
@@ -1037,9 +1306,11 @@ pub(super) fn route_edge_with_grid(
             }
             if let Some(occ) = occupancy {
                 let (cx, cy) = grid.cell_center(nx, ny);
-                let weight = occ.weight_at(cx, cy) as u32;
-                if weight > 0 {
-                    next_cost = next_cost.saturating_add(weight.saturating_mul(occupancy_weight));
+                let raw_weight = occ.weight_at(cx, cy) as f32;
+                if raw_weight > 0.0 {
+                    let compressed_weight = raw_weight.sqrt().max(1.0).round() as u32;
+                    next_cost = next_cost
+                        .saturating_add(compressed_weight.saturating_mul(occupancy_weight));
                 }
             }
             let next_idx = ((ny * cols + nx) as usize) * 4 + dir_idx;
@@ -1103,32 +1374,61 @@ pub(super) fn route_edge_with_grid(
     Some(compress_path(&points))
 }
 
-pub(super) fn push_route_candidate_metrics(
+fn push_route_candidate(
     points: Vec<(f32, f32)>,
     ctx: &RouteContext<'_>,
     existing_segments: &[((f32, f32), (f32, f32))],
     use_existing: bool,
-    candidates: &mut Vec<Vec<(f32, f32)>>,
-    intersections: &mut Vec<usize>,
-    crossings: &mut Vec<usize>,
-    label_hits: &mut Vec<usize>,
-    overlaps: &mut Vec<f32>,
+    candidates: &mut Vec<RouteCandidate>,
 ) {
     if points.len() < 2 || !path_coords_reasonable(&points) {
         return;
     }
-    let hits = path_obstacle_intersections(&points, ctx.obstacles, ctx.from_id, ctx.to_id);
-    let labels = path_label_intersections(&points, ctx.label_obstacles);
-    let (cross, overlap) = if use_existing {
+    let hard_hits = path_obstacle_intersections(&points, ctx.obstacles, ctx.from_id, ctx.to_id);
+    let soft_hits = path_obstacle_near_intersections(
+        &points,
+        ctx.obstacles,
+        ctx.from_id,
+        ctx.to_id,
+        ROUTE_SOFT_NODE_CLEARANCE,
+    );
+    let hits = hard_hits.saturating_mul(4).saturating_add(soft_hits);
+    let own_label = preferred_label_metrics(&points, ctx);
+    let hard_labels =
+        path_label_intersections(&points, ctx.label_obstacles, ctx.preferred_label_id);
+    let soft_labels = path_label_near_intersections(
+        &points,
+        ctx.label_obstacles,
+        ctx.preferred_label_id,
+        ROUTE_SOFT_LABEL_CLEARANCE,
+    );
+    let labels = hard_labels.saturating_mul(4).saturating_add(soft_labels);
+    let via_dist = ctx
+        .preferred_label_center
+        .map(|center| polyline_point_distance(&points, center))
+        .unwrap_or(0.0);
+    let (cross, mut overlap) = if use_existing {
         edge_crossings_with_existing(&points, existing_segments)
     } else {
         (0, 0.0)
     };
-    candidates.push(points);
-    intersections.push(hits);
-    crossings.push(cross);
-    label_hits.push(labels);
-    overlaps.push(overlap);
+    if use_existing {
+        overlap +=
+            path_existing_proximity_penalty(&points, existing_segments, ROUTE_SOFT_EDGE_CLEARANCE);
+    }
+    let bends = path_bend_count(&points);
+    let len = path_length(&points);
+    candidates.push(RouteCandidate {
+        points,
+        hits,
+        own_label,
+        cross,
+        label_hits: labels,
+        overlap,
+        via_dist,
+        bends,
+        len,
+    });
 }
 
 pub(super) fn path_coords_reasonable(points: &[(f32, f32)]) -> bool {
@@ -1169,6 +1469,123 @@ fn apply_endpoint_insets(
     path
 }
 
+fn point_segment_distance(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
+    let vx = b.0 - a.0;
+    let vy = b.1 - a.1;
+    let wx = p.0 - a.0;
+    let wy = p.1 - a.1;
+    let vv = vx * vx + vy * vy;
+    if vv <= 1e-6 {
+        let dx = p.0 - a.0;
+        let dy = p.1 - a.1;
+        return (dx * dx + dy * dy).sqrt();
+    }
+    let t = ((wx * vx + wy * vy) / vv).clamp(0.0, 1.0);
+    let proj_x = a.0 + t * vx;
+    let proj_y = a.1 + t * vy;
+    let dx = p.0 - proj_x;
+    let dy = p.1 - proj_y;
+    (dx * dx + dy * dy).sqrt()
+}
+
+pub(super) fn polyline_point_distance(points: &[(f32, f32)], point: (f32, f32)) -> f32 {
+    if points.is_empty() {
+        return f32::INFINITY;
+    }
+    if points.len() == 1 {
+        let dx = points[0].0 - point.0;
+        let dy = points[0].1 - point.1;
+        return (dx * dx + dy * dy).sqrt();
+    }
+    let mut best = f32::INFINITY;
+    for segment in points.windows(2) {
+        best = best.min(point_segment_distance(segment[0], segment[1], point));
+    }
+    best
+}
+
+fn enforce_preferred_label_via(points: &mut Vec<(f32, f32)>, ctx: &RouteContext<'_>) {
+    if !ctx.force_preferred_label_via {
+        return;
+    }
+    let Some(via) = ctx.preferred_label_center else {
+        return;
+    };
+    if points.len() < 2 {
+        return;
+    }
+    if polyline_point_distance(points, via) <= 0.6 {
+        return;
+    }
+    insert_label_via_point(points, via, ctx.direction);
+}
+
+fn push_preferred_label_detour_candidates(
+    ctx: &RouteContext<'_>,
+    route_start: (f32, f32),
+    route_end: (f32, f32),
+    existing_segments: &[((f32, f32), (f32, f32))],
+    use_existing: bool,
+    candidates: &mut Vec<RouteCandidate>,
+) {
+    let Some(obstacle) = ctx.preferred_label_obstacle else {
+        return;
+    };
+    let expanded = expand_obstacle(obstacle, ctx.preferred_label_clearance.max(0.0));
+    let left = expanded.x;
+    let right = expanded.x + expanded.width;
+    let top = expanded.y;
+    let bottom = expanded.y + expanded.height;
+
+    if is_horizontal(ctx.direction) {
+        let forward = route_end.0 >= route_start.0;
+        let (near_x, far_x) = if forward {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        for y in [top, bottom] {
+            push_route_candidate(
+                vec![
+                    route_start,
+                    (near_x, route_start.1),
+                    (near_x, y),
+                    (far_x, y),
+                    (far_x, route_end.1),
+                    route_end,
+                ],
+                ctx,
+                existing_segments,
+                use_existing,
+                candidates,
+            );
+        }
+    } else {
+        let forward = route_end.1 >= route_start.1;
+        let (near_y, far_y) = if forward {
+            (top, bottom)
+        } else {
+            (bottom, top)
+        };
+        for x in [left, right] {
+            push_route_candidate(
+                vec![
+                    route_start,
+                    (route_start.0, near_y),
+                    (x, near_y),
+                    (x, far_y),
+                    (route_end.0, far_y),
+                    route_end,
+                ],
+                ctx,
+                existing_segments,
+                use_existing,
+                candidates,
+            );
+        }
+    }
+}
+
 pub(super) fn route_edge_with_avoidance(
     ctx: &RouteContext<'_>,
     occupancy: Option<&EdgeOccupancy>,
@@ -1178,98 +1595,45 @@ pub(super) fn route_edge_with_avoidance(
     if ctx.from_id == ctx.to_id {
         let existing_segments = existing.unwrap_or(&[]);
         let use_existing = !existing_segments.is_empty();
-        let mut candidates: Vec<Vec<(f32, f32)>> = Vec::new();
-        let mut intersections: Vec<usize> = Vec::new();
-        let mut crossings: Vec<usize> = Vec::new();
-        let mut label_hits: Vec<usize> = Vec::new();
-        let mut overlaps: Vec<f32> = Vec::new();
+        let mut candidates: Vec<RouteCandidate> = Vec::new();
 
         let pad = ctx.config.node_spacing.max(ROUTING_PAD_MIN_SPACING) * ROUTING_PAD_RATIO;
         for points in route_self_loop_candidates(ctx.from, pad) {
-            push_route_candidate_metrics(
+            push_route_candidate(
                 points,
                 ctx,
                 existing_segments,
                 use_existing,
                 &mut candidates,
-                &mut intersections,
-                &mut crossings,
-                &mut label_hits,
-                &mut overlaps,
             );
         }
-        push_route_candidate_metrics(
+        push_route_candidate(
             route_self_loop(ctx.from, ctx.direction, ctx.config),
             ctx,
             existing_segments,
             use_existing,
             &mut candidates,
-            &mut intersections,
-            &mut crossings,
-            &mut label_hits,
-            &mut overlaps,
         );
 
         if candidates.is_empty() {
             return route_self_loop(ctx.from, ctx.direction, ctx.config);
         }
 
-        let mut best_idx = 0usize;
-        let mut best_hits = usize::MAX;
-        let mut best_cross = usize::MAX;
-        let mut best_label_hits = usize::MAX;
-        let mut best_overlap = f32::MAX;
-        let mut best_bends = usize::MAX;
-        let mut best_len = f32::MAX;
-        let mut best_score = u32::MAX;
-
-        for (idx, points) in candidates.iter().enumerate() {
-            let hits = intersections.get(idx).copied().unwrap_or(0);
-            let cross = crossings.get(idx).copied().unwrap_or(0);
-            let label = label_hits.get(idx).copied().unwrap_or(0);
-            let overlap = overlaps.get(idx).copied().unwrap_or(0.0);
-            let bends = path_bend_count(points);
-            let len = path_length(points);
-            let score = occupancy.map(|grid| grid.score_path(points)).unwrap_or(0);
-            if hits < best_hits
-                || (hits == best_hits && cross < best_cross)
-                || (hits == best_hits && cross == best_cross && label < best_label_hits)
-                || (hits == best_hits
-                    && cross == best_cross
-                    && label == best_label_hits
-                    && overlap < best_overlap)
-                || (hits == best_hits
-                    && cross == best_cross
-                    && label == best_label_hits
-                    && (overlap - best_overlap).abs() <= 1e-4
-                    && bends < best_bends)
-                || (hits == best_hits
-                    && cross == best_cross
-                    && label == best_label_hits
-                    && (overlap - best_overlap).abs() <= 1e-4
-                    && bends == best_bends
-                    && occupancy.is_some()
-                    && score < best_score)
-                || (hits == best_hits
-                    && cross == best_cross
-                    && label == best_label_hits
-                    && (overlap - best_overlap).abs() <= 1e-4
-                    && bends == best_bends
-                    && (!occupancy.is_some() || score == best_score)
-                    && len < best_len)
-            {
-                best_hits = hits;
-                best_cross = cross;
-                best_label_hits = label;
-                best_overlap = overlap;
-                best_bends = bends;
-                best_len = len;
-                best_score = score;
-                best_idx = idx;
+        let mut best_idx = None;
+        let mut best_key = None;
+        for (idx, candidate) in candidates.iter().enumerate() {
+            let occupancy_score = occupancy.map(|grid| grid.score_path(&candidate.points));
+            let key = route_candidate_key(candidate, occupancy_score);
+            let better = route_candidate_better(ctx, key, best_key);
+            if better {
+                best_key = Some(key);
+                best_idx = Some(idx);
             }
         }
 
-        return apply_endpoint_insets(compress_path(&candidates.swap_remove(best_idx)), ctx.start_inset, ctx.end_inset);
+        let mut best = compress_path(&candidates.swap_remove(best_idx.expect("candidate")).points);
+        enforce_preferred_label_via(&mut best, ctx);
+        return apply_endpoint_insets(compress_path(&best), ctx.start_inset, ctx.end_inset);
     }
 
     let (_, _, is_backward) = edge_sides(ctx.from, ctx.to, ctx.direction);
@@ -1301,13 +1665,11 @@ pub(super) fn route_edge_with_avoidance(
         }
     }
     if ctx.fast_route {
-        return apply_endpoint_insets(compress_path(&[start, route_start, route_end, end]), ctx.start_inset, ctx.end_inset);
+        let mut fast = compress_path(&[start, route_start, route_end, end]);
+        enforce_preferred_label_via(&mut fast, ctx);
+        return apply_endpoint_insets(compress_path(&fast), ctx.start_inset, ctx.end_inset);
     }
-    let mut candidates: Vec<Vec<(f32, f32)>> = Vec::new();
-    let mut intersections: Vec<usize> = Vec::new();
-    let mut crossings: Vec<usize> = Vec::new();
-    let mut label_hits: Vec<usize> = Vec::new();
-    let mut overlaps: Vec<f32> = Vec::new();
+    let mut candidates: Vec<RouteCandidate> = Vec::new();
     let existing_segments = existing.unwrap_or(&[]);
     let use_existing = !existing_segments.is_empty();
 
@@ -1357,16 +1719,12 @@ pub(super) fn route_edge_with_avoidance(
                 (route_x, route_end.1),
                 route_end,
             ];
-            push_route_candidate_metrics(
+            push_route_candidate(
                 points,
                 ctx,
                 existing_segments,
                 use_existing,
                 &mut candidates,
-                &mut intersections,
-                &mut crossings,
-                &mut label_hits,
-                &mut overlaps,
             );
         }
 
@@ -1379,16 +1737,12 @@ pub(super) fn route_edge_with_avoidance(
                 (route_end.0, route_y),
                 route_end,
             ];
-            push_route_candidate_metrics(
+            push_route_candidate(
                 points,
                 ctx,
                 existing_segments,
                 use_existing,
                 &mut candidates,
-                &mut intersections,
-                &mut crossings,
-                &mut label_hits,
-                &mut overlaps,
             );
         }
 
@@ -1401,16 +1755,12 @@ pub(super) fn route_edge_with_avoidance(
                 (route_end.0, route_y),
                 route_end,
             ];
-            push_route_candidate_metrics(
+            push_route_candidate(
                 points,
                 ctx,
                 existing_segments,
                 use_existing,
                 &mut candidates,
-                &mut intersections,
-                &mut crossings,
-                &mut label_hits,
-                &mut overlaps,
             );
         }
 
@@ -1423,33 +1773,68 @@ pub(super) fn route_edge_with_avoidance(
                 (route_x, route_end.1),
                 route_end,
             ];
-            push_route_candidate_metrics(
+            push_route_candidate(
                 points,
                 ctx,
                 existing_segments,
                 use_existing,
                 &mut candidates,
-                &mut intersections,
-                &mut crossings,
-                &mut label_hits,
-                &mut overlaps,
             );
         }
     }
 
     // Check if a direct line is possible (no obstacles in the way)
     let direct_path = vec![route_start, route_end];
-    push_route_candidate_metrics(
+    push_route_candidate(
         direct_path,
         ctx,
         existing_segments,
         use_existing,
         &mut candidates,
-        &mut intersections,
-        &mut crossings,
-        &mut label_hits,
-        &mut overlaps,
     );
+
+    push_preferred_label_detour_candidates(
+        ctx,
+        route_start,
+        route_end,
+        existing_segments,
+        use_existing,
+        &mut candidates,
+    );
+
+    if let Some(via) = ctx.preferred_label_center {
+        let via_mid_x = via.0;
+        let via_mid_y = via.1;
+        let through_vertical = vec![
+            route_start,
+            (via_mid_x, route_start.1),
+            (via_mid_x, via_mid_y),
+            (via_mid_x, route_end.1),
+            route_end,
+        ];
+        push_route_candidate(
+            through_vertical,
+            ctx,
+            existing_segments,
+            use_existing,
+            &mut candidates,
+        );
+
+        let through_horizontal = vec![
+            route_start,
+            (route_start.0, via_mid_y),
+            (via_mid_x, via_mid_y),
+            (route_end.0, via_mid_y),
+            route_end,
+        ];
+        push_route_candidate(
+            through_horizontal,
+            ctx,
+            existing_segments,
+            use_existing,
+            &mut candidates,
+        );
+    }
 
     // Fall back to orthogonal routing with control points
     let step = ctx.config.node_spacing.max(ORTHO_STEP_MIN_SPACING) * ROUTING_PAD_RATIO;
@@ -1479,16 +1864,12 @@ pub(super) fn route_edge_with_avoidance(
                 (mid_x, route_end.1),
                 route_end,
             ];
-            push_route_candidate_metrics(
+            push_route_candidate(
                 points,
                 ctx,
                 existing_segments,
                 use_existing,
                 &mut candidates,
-                &mut intersections,
-                &mut crossings,
-                &mut label_hits,
-                &mut overlaps,
             );
 
             let mid_y = (route_start.1 + route_end.1) / 2.0 + offset;
@@ -1498,17 +1879,7 @@ pub(super) fn route_edge_with_avoidance(
                 (route_end.0, mid_y),
                 route_end,
             ];
-            push_route_candidate_metrics(
-                alt,
-                ctx,
-                existing_segments,
-                use_existing,
-                &mut candidates,
-                &mut intersections,
-                &mut crossings,
-                &mut label_hits,
-                &mut overlaps,
-            );
+            push_route_candidate(alt, ctx, existing_segments, use_existing, &mut candidates);
 
             if use_channel_candidates && offset_rank <= 3 {
                 let near_start_x = route_start.0 + offset;
@@ -1518,16 +1889,12 @@ pub(super) fn route_edge_with_avoidance(
                     (near_start_x, route_end.1),
                     route_end,
                 ];
-                push_route_candidate_metrics(
+                push_route_candidate(
                     near_start,
                     ctx,
                     existing_segments,
                     use_existing,
                     &mut candidates,
-                    &mut intersections,
-                    &mut crossings,
-                    &mut label_hits,
-                    &mut overlaps,
                 );
 
                 let near_end_x = route_end.0 + offset;
@@ -1537,16 +1904,12 @@ pub(super) fn route_edge_with_avoidance(
                     (near_end_x, route_end.1),
                     route_end,
                 ];
-                push_route_candidate_metrics(
+                push_route_candidate(
                     near_end,
                     ctx,
                     existing_segments,
                     use_existing,
                     &mut candidates,
-                    &mut intersections,
-                    &mut crossings,
-                    &mut label_hits,
-                    &mut overlaps,
                 );
             }
         } else {
@@ -1557,16 +1920,12 @@ pub(super) fn route_edge_with_avoidance(
                 (route_end.0, mid_y),
                 route_end,
             ];
-            push_route_candidate_metrics(
+            push_route_candidate(
                 points,
                 ctx,
                 existing_segments,
                 use_existing,
                 &mut candidates,
-                &mut intersections,
-                &mut crossings,
-                &mut label_hits,
-                &mut overlaps,
             );
 
             let mid_x = (route_start.0 + route_end.0) / 2.0 + offset;
@@ -1576,17 +1935,7 @@ pub(super) fn route_edge_with_avoidance(
                 (mid_x, route_end.1),
                 route_end,
             ];
-            push_route_candidate_metrics(
-                alt,
-                ctx,
-                existing_segments,
-                use_existing,
-                &mut candidates,
-                &mut intersections,
-                &mut crossings,
-                &mut label_hits,
-                &mut overlaps,
-            );
+            push_route_candidate(alt, ctx, existing_segments, use_existing, &mut candidates);
 
             if use_channel_candidates && offset_rank <= 3 {
                 let near_start_y = route_start.1 + offset;
@@ -1596,16 +1945,12 @@ pub(super) fn route_edge_with_avoidance(
                     (route_end.0, near_start_y),
                     route_end,
                 ];
-                push_route_candidate_metrics(
+                push_route_candidate(
                     near_start,
                     ctx,
                     existing_segments,
                     use_existing,
                     &mut candidates,
-                    &mut intersections,
-                    &mut crossings,
-                    &mut label_hits,
-                    &mut overlaps,
                 );
 
                 let near_end_y = route_end.1 + offset;
@@ -1615,26 +1960,43 @@ pub(super) fn route_edge_with_avoidance(
                     (route_end.0, near_end_y),
                     route_end,
                 ];
-                push_route_candidate_metrics(
+                push_route_candidate(
                     near_end,
                     ctx,
                     existing_segments,
                     use_existing,
                     &mut candidates,
-                    &mut intersections,
-                    &mut crossings,
-                    &mut label_hits,
-                    &mut overlaps,
                 );
             }
         }
     }
 
-    let min_hits = intersections.iter().copied().min().unwrap_or(0);
-    let min_crossings = crossings.iter().copied().min().unwrap_or(0);
-    let min_label_hits = label_hits.iter().copied().min().unwrap_or(0);
-    let min_overlap = overlaps.iter().copied().fold(f32::INFINITY, f32::min);
+    let min_hits = candidates
+        .iter()
+        .map(|candidate| candidate.hits)
+        .min()
+        .unwrap_or(0);
+    let min_own_label_score = candidates
+        .iter()
+        .map(|candidate| own_label_score(candidate.own_label))
+        .min()
+        .unwrap_or(0);
+    let min_crossings = candidates
+        .iter()
+        .map(|candidate| candidate.cross)
+        .min()
+        .unwrap_or(0);
+    let min_label_hits = candidates
+        .iter()
+        .map(|candidate| candidate.label_hits)
+        .min()
+        .unwrap_or(0);
+    let min_overlap = candidates
+        .iter()
+        .map(|candidate| candidate.overlap)
+        .fold(f32::INFINITY, f32::min);
     let mut needs_detour = min_crossings > 0
+        || min_own_label_score > 0
         || min_label_hits > 0
         || (min_overlap.is_finite() && min_overlap >= OVERLAP_DETOUR_MIN);
     if min_hits == 0
@@ -1644,23 +2006,31 @@ pub(super) fn route_edge_with_avoidance(
         let mut best_score = u32::MAX;
         let mut best_bends = usize::MAX;
         let mut best_len = f32::MAX;
-        for (idx, points) in candidates.iter().enumerate() {
-            let score = occ.score_path(points);
-            let bends = path_bend_count(points);
-            let len = path_length(points);
-            if score < best_score
-                || (score == best_score && bends < best_bends)
-                || (score == best_score && bends == best_bends && len < best_len)
-            {
+        for (idx, candidate) in candidates.iter().enumerate() {
+            let score = occ.score_path(&candidate.points);
+            let bends = candidate.bends;
+            let len = candidate.len;
+            let better = if ctx.prefer_shorter_ties {
+                score < best_score
+                    || (score == best_score && len + ROUTE_LENGTH_TIE_EPS < best_len)
+                    || (score == best_score
+                        && (len - best_len).abs() <= ROUTE_LENGTH_TIE_EPS
+                        && bends < best_bends)
+            } else {
+                score < best_score
+                    || (score == best_score && bends < best_bends)
+                    || (score == best_score && bends == best_bends && len < best_len)
+            };
+            if better {
                 best_score = score;
                 best_bends = bends;
                 best_len = len;
                 best_idx = idx;
             }
         }
-        if let Some(points) = candidates.get(best_idx) {
-            let overlap = occ.overlap_count(points);
-            let path_len = path_length(points);
+        if let Some(candidate) = candidates.get(best_idx) {
+            let overlap = occ.overlap_count(&candidate.points);
+            let path_len = candidate.len;
             let overlap_trigger = ((path_len / occ.cell) * OVERLAP_TRIGGER_RATIO)
                 .max(OVERLAP_TRIGGER_MIN)
                 .ceil() as u32;
@@ -1692,145 +2062,98 @@ pub(super) fn route_edge_with_avoidance(
                         route_end,
                     ]
                 };
-                push_route_candidate_metrics(
+                push_route_candidate(
                     points,
                     ctx,
                     existing_segments,
                     use_existing,
                     &mut candidates,
-                    &mut intersections,
-                    &mut crossings,
-                    &mut label_hits,
-                    &mut overlaps,
                 );
             }
         }
     }
 
-    let min_hits = intersections.iter().copied().min().unwrap_or(0);
+    let min_hits = candidates
+        .iter()
+        .map(|candidate| candidate.hits)
+        .min()
+        .unwrap_or(0);
     if (min_hits > 0 || needs_detour)
         && let Some(grid) = grid
-        && let Some(points) = route_edge_with_grid(ctx, grid, occupancy, route_start, route_end)
     {
-        push_route_candidate_metrics(
-            points,
-            ctx,
-            existing_segments,
-            use_existing,
-            &mut candidates,
-            &mut intersections,
-            &mut crossings,
-            &mut label_hits,
-            &mut overlaps,
-        );
+        let mut coarse_retry = false;
+        if let Some(points) = route_edge_with_grid(ctx, grid, occupancy, route_start, route_end) {
+            let before = candidates.len();
+            push_route_candidate(
+                points,
+                ctx,
+                existing_segments,
+                use_existing,
+                &mut candidates,
+            );
+            if candidates.len() > before {
+                let candidate = &candidates[candidates.len() - 1];
+                coarse_retry = candidate.hits > 0
+                    || own_label_score(candidate.own_label) > 0
+                    || candidate.label_hits > 0
+                    || candidate.cross > 0
+                    || candidate.overlap >= OVERLAP_DETOUR_MIN;
+            }
+        } else {
+            coarse_retry = true;
+        }
+        if coarse_retry
+            && ctx.coarse_grid_retry
+            && let Some(coarse) = build_fallback_routing_grid(ctx.obstacles, ctx.config, grid.cell)
+            && let Some(points) =
+                route_edge_with_grid(ctx, &coarse, occupancy, route_start, route_end)
+        {
+            push_route_candidate(
+                points,
+                ctx,
+                existing_segments,
+                use_existing,
+                &mut candidates,
+            );
+        }
     }
 
     if let Some(grid) = occupancy {
-        let mut best_idx = 0usize;
-        let mut best_hits = usize::MAX;
-        let mut best_cross = usize::MAX;
-        let mut best_label_hits = usize::MAX;
-        let mut best_overlap = f32::MAX;
-        let mut best_bends = usize::MAX;
-        let mut best_score = u32::MAX;
-        let mut best_len = f32::MAX;
-        for (idx, points) in candidates.iter().enumerate() {
-            let hits = intersections.get(idx).copied().unwrap_or(0);
-            let cross = crossings.get(idx).copied().unwrap_or(0);
-            let label = label_hits.get(idx).copied().unwrap_or(0);
-            let overlap = overlaps.get(idx).copied().unwrap_or(0.0);
-            let bends = path_bend_count(points);
-            let score = grid.score_path(points);
-            let len = path_length(points);
-            if hits < best_hits
-                || (hits == best_hits && cross < best_cross)
-                || (hits == best_hits && cross == best_cross && label < best_label_hits)
-                || (hits == best_hits
-                    && cross == best_cross
-                    && label == best_label_hits
-                    && overlap < best_overlap)
-                || (hits == best_hits
-                    && cross == best_cross
-                    && label == best_label_hits
-                    && (overlap - best_overlap).abs() <= 1e-4
-                    && bends < best_bends)
-                || (hits == best_hits
-                    && cross == best_cross
-                    && label == best_label_hits
-                    && (overlap - best_overlap).abs() <= 1e-4
-                    && bends == best_bends
-                    && score < best_score)
-                || (hits == best_hits
-                    && cross == best_cross
-                    && label == best_label_hits
-                    && (overlap - best_overlap).abs() <= 1e-4
-                    && bends == best_bends
-                    && score == best_score
-                    && len < best_len)
-            {
-                best_hits = hits;
-                best_cross = cross;
-                best_label_hits = label;
-                best_overlap = overlap;
-                best_bends = bends;
-                best_score = score;
-                best_len = len;
-                best_idx = idx;
+        let mut best_idx = None;
+        let mut best_key = None;
+        for (idx, candidate) in candidates.iter().enumerate() {
+            let key = route_candidate_key(candidate, Some(grid.score_path(&candidate.points)));
+            let better = route_candidate_better(ctx, key, best_key);
+            if better {
+                best_idx = Some(idx);
+                best_key = Some(key);
             }
         }
-        let mut combined = Vec::with_capacity(candidates[best_idx].len() + 2);
+        let best = candidates.swap_remove(best_idx.expect("candidate"));
+        let mut combined = Vec::with_capacity(best.points.len() + 2);
         combined.push(start);
-        combined.extend(candidates.swap_remove(best_idx));
+        combined.extend(best.points);
         combined.push(end);
+        enforce_preferred_label_via(&mut combined, ctx);
         return apply_endpoint_insets(compress_path(&combined), ctx.start_inset, ctx.end_inset);
     }
 
-    let mut best_idx = 0usize;
-    let mut best_hits = usize::MAX;
-    let mut best_cross = usize::MAX;
-    let mut best_label_hits = usize::MAX;
-    let mut best_overlap = f32::MAX;
-    let mut best_bends = usize::MAX;
-    let mut best_len = f32::MAX;
-    for (idx, points) in candidates.iter().enumerate() {
-        let hits = intersections.get(idx).copied().unwrap_or(0);
-        let cross = crossings.get(idx).copied().unwrap_or(0);
-        let label = label_hits.get(idx).copied().unwrap_or(0);
-        let overlap = overlaps.get(idx).copied().unwrap_or(0.0);
-        let bends = path_bend_count(points);
-        let len = path_length(points);
-        if hits < best_hits
-            || (hits == best_hits && cross < best_cross)
-            || (hits == best_hits && cross == best_cross && label < best_label_hits)
-            || (hits == best_hits
-                && cross == best_cross
-                && label == best_label_hits
-                && overlap < best_overlap)
-            || (hits == best_hits
-                && cross == best_cross
-                && label == best_label_hits
-                && (overlap - best_overlap).abs() <= 1e-4
-                && bends < best_bends)
-            || (hits == best_hits
-                && cross == best_cross
-                && label == best_label_hits
-                && (overlap - best_overlap).abs() <= 1e-4
-                && bends == best_bends
-                && len < best_len)
-        {
-            best_hits = hits;
-            best_cross = cross;
-            best_label_hits = label;
-            best_overlap = overlap;
-            best_bends = bends;
-            best_len = len;
-            best_idx = idx;
+    let mut best_idx = None;
+    let mut best_key = None;
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let key = route_candidate_key(candidate, None);
+        let better = route_candidate_better(ctx, key, best_key);
+        if better {
+            best_idx = Some(idx);
+            best_key = Some(key);
         }
     }
-    let mut combined = Vec::with_capacity(candidates[best_idx].len() + 2);
+    let best = candidates.swap_remove(best_idx.expect("candidate"));
+    let mut combined = Vec::with_capacity(best.points.len() + 2);
     combined.push(start);
-    combined.extend(candidates.swap_remove(best_idx));
+    combined.extend(best.points);
     combined.push(end);
+    enforce_preferred_label_via(&mut combined, ctx);
     apply_endpoint_insets(compress_path(&combined), ctx.start_inset, ctx.end_inset)
 }
 
@@ -1866,6 +2189,7 @@ pub(super) fn path_obstacle_intersections(
 pub(super) fn path_label_intersections(
     points: &[(f32, f32)],
     label_obstacles: &[Obstacle],
+    ignore_label_id: Option<&str>,
 ) -> usize {
     if points.len() < 2 || label_obstacles.is_empty() {
         return 0;
@@ -1874,12 +2198,129 @@ pub(super) fn path_label_intersections(
     for segment in points.windows(2) {
         let (a, b) = (segment[0], segment[1]);
         for obstacle in label_obstacles {
+            if ignore_label_id.is_some_and(|id| id == obstacle.id) {
+                continue;
+            }
             if segment_intersects_rect(a, b, obstacle) {
                 count += 1;
             }
         }
     }
     count
+}
+
+fn path_obstacle_near_intersections(
+    points: &[(f32, f32)],
+    obstacles: &[Obstacle],
+    from_id: &str,
+    to_id: &str,
+    pad: f32,
+) -> usize {
+    if points.len() < 2 || obstacles.is_empty() || pad <= 0.0 {
+        return 0;
+    }
+    let mut count = 0usize;
+    for segment in points.windows(2) {
+        let (a, b) = (segment[0], segment[1]);
+        for obstacle in obstacles {
+            if obstacle.id == from_id || obstacle.id == to_id {
+                continue;
+            }
+            if let Some(members) = &obstacle.members
+                && (members.contains(from_id) || members.contains(to_id))
+            {
+                continue;
+            }
+            if segment_intersects_rect(a, b, obstacle) {
+                continue;
+            }
+            let expanded = Obstacle {
+                id: String::new(),
+                x: obstacle.x - pad,
+                y: obstacle.y - pad,
+                width: obstacle.width + pad * 2.0,
+                height: obstacle.height + pad * 2.0,
+                members: None,
+            };
+            if segment_intersects_rect(a, b, &expanded) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn path_label_near_intersections(
+    points: &[(f32, f32)],
+    label_obstacles: &[Obstacle],
+    ignore_label_id: Option<&str>,
+    pad: f32,
+) -> usize {
+    if points.len() < 2 || label_obstacles.is_empty() || pad <= 0.0 {
+        return 0;
+    }
+    let mut count = 0usize;
+    for segment in points.windows(2) {
+        let (a, b) = (segment[0], segment[1]);
+        for obstacle in label_obstacles {
+            if ignore_label_id.is_some_and(|id| id == obstacle.id) {
+                continue;
+            }
+            if segment_intersects_rect(a, b, obstacle) {
+                continue;
+            }
+            let expanded = Obstacle {
+                id: String::new(),
+                x: obstacle.x - pad,
+                y: obstacle.y - pad,
+                width: obstacle.width + pad * 2.0,
+                height: obstacle.height + pad * 2.0,
+                members: None,
+            };
+            if segment_intersects_rect(a, b, &expanded) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn segment_to_segment_distance(
+    a1: (f32, f32),
+    a2: (f32, f32),
+    b1: (f32, f32),
+    b2: (f32, f32),
+) -> f32 {
+    if segments_intersect(a1, a2, b1, b2) {
+        return 0.0;
+    }
+    let d1 = point_segment_distance(a1, a2, b1);
+    let d2 = point_segment_distance(a1, a2, b2);
+    let d3 = point_segment_distance(b1, b2, a1);
+    let d4 = point_segment_distance(b1, b2, a2);
+    d1.min(d2).min(d3).min(d4)
+}
+
+fn path_existing_proximity_penalty(
+    points: &[(f32, f32)],
+    existing_segments: &[Segment],
+    clearance: f32,
+) -> f32 {
+    if points.len() < 2 || existing_segments.is_empty() || clearance <= 0.0 {
+        return 0.0;
+    }
+    let mut penalty = 0.0f32;
+    for segment in points.windows(2) {
+        let a1 = segment[0];
+        let a2 = segment[1];
+        for &(b1, b2) in existing_segments {
+            let dist = segment_to_segment_distance(a1, a2, b1, b2);
+            if dist < clearance {
+                penalty += (clearance - dist) / clearance;
+            }
+        }
+    }
+    penalty
 }
 
 pub(super) fn path_length(points: &[(f32, f32)]) -> f32 {
@@ -1890,6 +2331,33 @@ pub(super) fn path_length(points: &[(f32, f32)]) -> f32 {
         length += (dx * dx + dy * dy).sqrt();
     }
     length
+}
+
+pub(super) fn path_point_at_progress(points: &[(f32, f32)], progress: f32) -> Option<(f32, f32)> {
+    if points.len() < 2 {
+        return None;
+    }
+    let total = path_length(points);
+    if !total.is_finite() || total <= 1e-6 {
+        return Some(points[0]);
+    }
+    let mut remain = total * progress.clamp(0.0, 1.0);
+    for segment in points.windows(2) {
+        let a = segment[0];
+        let b = segment[1];
+        let dx = b.0 - a.0;
+        let dy = b.1 - a.1;
+        let seg_len = (dx * dx + dy * dy).sqrt();
+        if seg_len <= 1e-6 {
+            continue;
+        }
+        if remain <= seg_len {
+            let t = remain / seg_len;
+            return Some((a.0 + dx * t, a.1 + dy * t));
+        }
+        remain -= seg_len;
+    }
+    points.last().copied()
 }
 
 pub(super) fn path_bend_count(points: &[(f32, f32)]) -> usize {
@@ -1917,45 +2385,9 @@ pub(super) fn path_bend_count(points: &[(f32, f32)]) -> usize {
 }
 
 pub(super) fn edge_label_anchor_from_points(points: &[(f32, f32)]) -> Option<(f32, f32)> {
-    if points.len() < 2 {
-        return None;
-    }
-    let segment_count = points.len() - 1;
-    let (start_idx, end_idx) = if segment_count >= 3 {
-        (1, segment_count - 1)
-    } else {
-        (0, segment_count)
-    };
-    let mut best_idx = None;
-    let mut best_len = 0.0f32;
-    for idx in start_idx..end_idx {
-        let p1 = points[idx];
-        let p2 = points[idx + 1];
-        let dx = p2.0 - p1.0;
-        let dy = p2.1 - p1.1;
-        let len = dx * dx + dy * dy;
-        if len > best_len {
-            best_len = len;
-            best_idx = Some(idx);
-        }
-    }
-    if best_idx.is_none() {
-        for idx in 0..segment_count {
-            let p1 = points[idx];
-            let p2 = points[idx + 1];
-            let dx = p2.0 - p1.0;
-            let dy = p2.1 - p1.1;
-            let len = dx * dx + dy * dy;
-            if len > best_len {
-                best_len = len;
-                best_idx = Some(idx);
-            }
-        }
-    }
-    let idx = best_idx.unwrap_or(0);
-    let p1 = points[idx];
-    let p2 = points[idx + 1];
-    Some(((p1.0 + p2.0) / 2.0, (p1.1 + p2.1) / 2.0))
+    // Center labels should stay on the geometric midpoint of the routed path
+    // (arc-length progress 0.5), not merely the midpoint of the longest run.
+    path_point_at_progress(points, 0.5)
 }
 
 pub(super) fn route_self_loop(

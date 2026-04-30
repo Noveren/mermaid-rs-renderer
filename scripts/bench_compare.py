@@ -15,6 +15,13 @@ import statistics
 import subprocess
 import sys
 import time
+import datetime
+import concurrent.futures
+import getpass
+import hashlib
+import platform
+import shutil
+import socket
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +41,24 @@ BIN = os.environ.get("MMDR_BIN", str(ROOT / "target" / "release" / "mmdr"))
 MMD_CLI = os.environ.get("MMD_CLI", "npx -y @mermaid-js/mermaid-cli")
 RUNS = int(os.environ.get("RUNS", "8"))
 WARMUP = int(os.environ.get("WARMUP", "2"))
+MMDR_MEASURE_MEMORY = False
+MMD_CLI_RUNS = int(os.environ.get("MMD_CLI_RUNS", "1"))
+MMD_CLI_WARMUP = int(os.environ.get("MMD_CLI_WARMUP", "0"))
+MMDR_JOBS = int(
+    os.environ.get("MMDR_JOBS", str(max(1, min(4, os.cpu_count() or 1))))
+)
+MMD_CLI_JOBS = int(
+    os.environ.get("MMD_CLI_JOBS", str(max(1, min(4, os.cpu_count() or 1))))
+)
+MMD_CLI_MEASURE_MEMORY = False
+MMDC_CONFIG = os.environ.get("MMDC_CONFIG", "")
+HISTORY_LOG = Path(
+    os.environ.get(
+        "HISTORY_LOG",
+        str(ROOT / "tmp" / "benchmark-history" / "bench-compare-runs.jsonl"),
+    )
+)
+MMDC_CACHE_SCHEMA_VERSION = 2
 
 CASE_NAMES = [
     "flowchart_small",
@@ -56,6 +81,16 @@ CASE_NAMES = [
     "flowchart_component_packing",
     "flowchart_direction_conflict",
     "flowchart_parallel_label_stack",
+    "flowchart_port_alignment_matrix",
+    "flowchart_path_occlusion_maze",
+    "flowchart_subgraph_boundary_intrusion",
+    "flowchart_parallel_edges_bundle",
+    "flowchart_flow_direction_backtrack",
+    "flowchart_mega_multihub_control",
+    "flowchart_mega_crosslane_subgraphs",
+    "flowchart_mega_braid_feedback",
+    "flowchart_mega_event_mesh",
+    "flowchart_mega_nested_regions",
     "class_medium",
     "state_medium",
     "sequence_medium",
@@ -88,6 +123,108 @@ CASE_NAMES = [
 ]
 
 
+def env_bool(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+MMDR_MEASURE_MEMORY = env_bool("MMDR_MEASURE_MEMORY")
+MMD_CLI_MEASURE_MEMORY = env_bool("MMD_CLI_MEASURE_MEMORY")
+
+
+def benchmark_env() -> dict:
+    env = os.environ.copy()
+    if "PUPPETEER_EXECUTABLE_PATH" not in env:
+        chrome = find_puppeteer_chrome()
+        if chrome:
+            env["PUPPETEER_EXECUTABLE_PATH"] = chrome
+    return env
+
+
+BENCHMARK_ENV = benchmark_env()
+
+
+def mmdc_cli_identity(cli_cmd: str) -> str:
+    result = subprocess.run(
+        shlex.split(cli_cmd) + ["--version"],
+        capture_output=True,
+        text=True,
+    )
+    output = (result.stdout or "").strip() or (result.stderr or "").strip()
+    if not output:
+        output = f"rc={result.returncode}"
+    return output.splitlines()[-1][:240]
+
+
+def mmdc_cache_digest(
+    fixture_path: Path,
+    cli_cmd: str,
+    cli_identity: str,
+    runs: int,
+    warmup: int,
+    config_path: str,
+) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(f"schema:{MMDC_CACHE_SCHEMA_VERSION}\n".encode("utf-8"))
+    hasher.update(f"cli:{cli_cmd}\n".encode("utf-8"))
+    hasher.update(f"cli_identity:{cli_identity}\n".encode("utf-8"))
+    hasher.update(f"runs:{runs}\n".encode("utf-8"))
+    hasher.update(f"warmup:{warmup}\n".encode("utf-8"))
+    hasher.update(f"config:{config_path}\n".encode("utf-8"))
+    hasher.update(fixture_path.read_bytes())
+    if config_path:
+        cfg = Path(config_path)
+        if cfg.exists():
+            hasher.update(cfg.read_bytes())
+    return hasher.hexdigest()
+
+
+def load_json_if_exists(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def init_mmdc_cache_state() -> dict:
+    enabled = not env_bool("NO_MMDC_CACHE")
+    cache_dir = Path(
+        os.environ.get(
+            "MMDC_CACHE_DIR",
+            str(ROOT / "tmp" / "benchmark-cache" / "bench-compare" / "mmdc"),
+        )
+    )
+    if not enabled:
+        return {
+            "enabled": False,
+            "dir": cache_dir,
+            "cli_identity": "",
+            "hits": 0,
+            "misses": 0,
+        }
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "enabled": True,
+        "dir": cache_dir,
+        "cli_identity": mmdc_cli_identity(MMD_CLI),
+        "hits": 0,
+        "misses": 0,
+    }
+
+
 def resolve_cases():
     cases_env = os.environ.get("CASES")
     if cases_env:
@@ -104,18 +241,92 @@ def resolve_cases():
 CASES = resolve_cases()
 
 
+def iso_utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def git_metadata() -> dict:
+    def git(args: list[str]) -> str:
+        result = subprocess.run(
+            ["git"] + args,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
+    commit = git(["rev-parse", "HEAD"])
+    short = commit[:12] if commit else ""
+    branch = git(["rev-parse", "--abbrev-ref", "HEAD"])
+    describe = git(["describe", "--always", "--dirty", "--tags"])
+    status = git(["status", "--porcelain"])
+    return {
+        "commit": commit,
+        "commit_short": short,
+        "branch": branch,
+        "describe": describe,
+        "dirty": bool(status),
+    }
+
+
+def host_metadata() -> dict:
+    return {
+        "hostname": socket.gethostname(),
+        "user": getpass.getuser(),
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+    }
+
+
+def append_benchmark_history(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True))
+        handle.write("\n")
+
+
+def summarize_history(results: dict) -> dict:
+    mmdr_entries = results.get("mmdr", {})
+    cli_entries = results.get("mermaid_cli", {})
+    compared = []
+    cli_errors = 0
+    for case, mmdr in mmdr_entries.items():
+        mmdr_ms = mmdr.get("mean_ms")
+        cli = cli_entries.get(case, {})
+        if cli.get("error"):
+            cli_errors += 1
+            continue
+        cli_ms = cli.get("mean_ms")
+        if mmdr_ms and cli_ms:
+            compared.append((case, float(mmdr_ms), float(cli_ms), float(cli_ms) / float(mmdr_ms)))
+
+    speedups = [item[3] for item in compared]
+    best = max(compared, key=lambda item: item[3], default=None)
+    worst = min(compared, key=lambda item: item[3], default=None)
+
+    return {
+        "case_count": len(mmdr_entries),
+        "compared_case_count": len(compared),
+        "cli_error_count": cli_errors,
+        "mmdr_mean_ms_avg": statistics.mean([entry["mean_ms"] for entry in mmdr_entries.values()]) if mmdr_entries else 0.0,
+        "cli_mean_ms_avg": statistics.mean([item[2] for item in compared]) if compared else 0.0,
+        "speedup_mean": statistics.mean(speedups) if speedups else 0.0,
+        "speedup_median": statistics.median(speedups) if speedups else 0.0,
+        "speedup_best_case": best[0] if best else "",
+        "speedup_best_value": best[3] if best else 0.0,
+        "speedup_worst_case": worst[0] if worst else "",
+        "speedup_worst_value": worst[3] if worst else 0.0,
+    }
+
+
 def run_cmd(cmd, capture_stderr=False):
     """Run a command and return (success, stderr_output)."""
-    env = os.environ.copy()
-    if "PUPPETEER_EXECUTABLE_PATH" not in env:
-        chrome = find_puppeteer_chrome()
-        if chrome:
-            env["PUPPETEER_EXECUTABLE_PATH"] = chrome
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        env=env,
+        env=BENCHMARK_ENV,
     )
     if result.returncode != 0 and not capture_stderr:
         raise subprocess.CalledProcessError(result.returncode, cmd)
@@ -143,12 +354,7 @@ def get_memory_usage(cmd) -> Optional[int]:
             # Fall back to resource module for rough estimate
             try:
                 import resource
-                env = os.environ.copy()
-                if "PUPPETEER_EXECUTABLE_PATH" not in env:
-                    chrome = find_puppeteer_chrome()
-                    if chrome:
-                        env["PUPPETEER_EXECUTABLE_PATH"] = chrome
-                subprocess.run(cmd, capture_output=True, env=env)
+                subprocess.run(cmd, capture_output=True, env=BENCHMARK_ENV)
                 # This only gets the current process, not subprocess, so it's not accurate
                 # Return None to indicate we can't measure
                 return None
@@ -156,13 +362,8 @@ def get_memory_usage(cmd) -> Optional[int]:
                 return None
 
     time_cmd = [time_bin, "-v"] + cmd
-    env = os.environ.copy()
-    if "PUPPETEER_EXECUTABLE_PATH" not in env:
-        chrome = find_puppeteer_chrome()
-        if chrome:
-            env["PUPPETEER_EXECUTABLE_PATH"] = chrome
     try:
-        result = subprocess.run(time_cmd, capture_output=True, text=True, env=env)
+        result = subprocess.run(time_cmd, capture_output=True, text=True, env=BENCHMARK_ENV)
     except FileNotFoundError:
         return None
     if result.returncode != 0:
@@ -204,8 +405,8 @@ def bench_mmdr(path: Path):
             except json.JSONDecodeError:
                 pass
 
-    # Get memory usage
-    memory_kb = get_memory_usage(cmd_base)
+    # Optional: mmdr memory probing executes one extra process per case.
+    memory_kb = get_memory_usage(cmd_base) if MMDR_MEASURE_MEMORY else None
 
     return {
         "times": times,
@@ -214,52 +415,91 @@ def bench_mmdr(path: Path):
     }
 
 
-def bench_mermaid_cli(path: Path):
+def bench_mermaid_cli(path: Path, cache_state: dict):
     """Benchmark mermaid-cli (no timing breakdown available)."""
     out = ROOT / "target" / f"bench-{path.stem}-mmdc.svg"
-    cmd = MMD_CLI.split() + ["-i", str(path), "-o", str(out)]
+    cmd = shlex.split(MMD_CLI) + ["-i", str(path), "-o", str(out)]
+    if MMDC_CONFIG:
+        cfg = Path(MMDC_CONFIG)
+        if cfg.exists():
+            cmd += ["-c", str(cfg)]
+
+    cache_json_path: Optional[Path] = None
+    cache_svg_path: Optional[Path] = None
+    if cache_state.get("enabled"):
+        digest = mmdc_cache_digest(
+            path,
+            MMD_CLI,
+            cache_state.get("cli_identity", ""),
+            MMD_CLI_RUNS,
+            MMD_CLI_WARMUP,
+            MMDC_CONFIG,
+        )
+        cache_json_path = Path(cache_state["dir"]) / f"{digest}.json"
+        cache_svg_path = Path(cache_state["dir"]) / f"{digest}.svg"
+        cached = load_json_if_exists(cache_json_path)
+        if cached is not None:
+            if cache_svg_path.exists():
+                shutil.copy2(cache_svg_path, out)
+            cached_result = dict(cached)
+            cached_result["cached"] = True
+            cached_result["cache_hit"] = 1
+            cached_result["cache_miss"] = 0
+            return cached_result
 
     times = []
 
-    # Warmup (and preflight to detect unsupported diagrams)
-    if WARMUP == 0:
+    # Warmup (if any). When warmup is 0, do not run an extra preflight because that
+    # doubles cold-run mermaid-cli time.
+    for _ in range(MMD_CLI_WARMUP):
         success, stderr = run_cmd(cmd, capture_stderr=True)
         if not success:
-            return {
+            result = {
                 "times": [],
                 "memory_kb": None,
                 "error": short_error(stderr) or "mmdc failed",
+                "cache_hit": 0,
+                "cache_miss": 1 if cache_json_path else 0,
             }
-    else:
-        for _ in range(WARMUP):
-            success, stderr = run_cmd(cmd, capture_stderr=True)
-            if not success:
-                return {
-                    "times": [],
-                    "memory_kb": None,
-                    "error": short_error(stderr) or "mmdc failed",
-                }
+            if cache_json_path:
+                save_json(cache_json_path, result)
+            return result
 
     # Actual runs
-    for _ in range(RUNS):
+    measured_runs = MMD_CLI_RUNS if MMD_CLI_RUNS > 0 else 1
+    for _ in range(measured_runs):
         start = time.perf_counter()
         success, stderr = run_cmd(cmd, capture_stderr=True)
         elapsed = time.perf_counter() - start
         if not success:
-            return {
+            result = {
                 "times": [],
                 "memory_kb": None,
                 "error": short_error(stderr) or "mmdc failed",
+                "cache_hit": 0,
+                "cache_miss": 1 if cache_json_path else 0,
             }
+            if cache_json_path:
+                save_json(cache_json_path, result)
+            return result
         times.append(elapsed)
 
-    # Get memory usage
-    memory_kb = get_memory_usage(cmd)
-
-    return {
+    # Optional: mermaid-cli memory probing is expensive because it executes
+    # the command again under `/usr/bin/time`.
+    memory_kb = get_memory_usage(cmd) if MMD_CLI_MEASURE_MEMORY else None
+    result = {
         "times": times,
         "memory_kb": memory_kb,
+        "cache_hit": 0,
+        "cache_miss": 1 if cache_json_path else 0,
     }
+    if cache_json_path:
+        save_json(cache_json_path, result)
+        if cache_svg_path and out.exists():
+            cache_svg_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(out, cache_svg_path)
+
+    return result
 
 
 def summarize(times):
@@ -473,41 +713,136 @@ def generate_breakdown_chart(results: dict, output_path: Path):
 
 def main():
     results = {"mmdr": {}, "mermaid_cli": {}}
+    mmdc_cache_state = init_mmdc_cache_state()
+    runtime = {}
+    run_start = time.perf_counter()
 
     print("Benchmarking mmdr...")
-    for name, path in CASES:
-        print(f"  {name}...", end=" ", flush=True)
-        data = bench_mmdr(path)
+    print(
+        "  sampling config: "
+        f"runs={RUNS}, warmup={WARMUP}, jobs={MMDR_JOBS}, "
+        f"measure_memory={str(MMDR_MEASURE_MEMORY).lower()}"
+    )
+    phase_start = time.perf_counter()
+    mmdr_data_by_case = {}
+    if MMDR_JOBS <= 1:
+        for name, path in CASES:
+            print(f"  {name}...", end=" ", flush=True)
+            data = bench_mmdr(path)
+            mmdr_data_by_case[name] = data
+            summary = summarize(data["times"])
+            breakdown = summarize_breakdowns(data["breakdowns"])
+            if breakdown:
+                print(
+                    f"total={summary['mean_ms']:.2f}ms "
+                    f"(parse={breakdown['parse_ms']:.2f} "
+                    f"layout={breakdown['layout_ms']:.2f} "
+                    f"render={breakdown['render_ms']:.2f})"
+                )
+            else:
+                print(f"total={summary['mean_ms']:.2f}ms")
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MMDR_JOBS) as pool:
+            future_to_name = {
+                pool.submit(bench_mmdr, path): name
+                for name, path in CASES
+            }
+            completed = 0
+            total = len(CASES)
+            for future in concurrent.futures.as_completed(future_to_name):
+                name = future_to_name[future]
+                data = future.result()
+                mmdr_data_by_case[name] = data
+                completed += 1
+                summary = summarize(data["times"])
+                breakdown = summarize_breakdowns(data["breakdowns"])
+                if breakdown:
+                    print(
+                        f"  [{completed:>2}/{total}] {name}... "
+                        f"total={summary['mean_ms']:.2f}ms "
+                        f"(parse={breakdown['parse_ms']:.2f} "
+                        f"layout={breakdown['layout_ms']:.2f} "
+                        f"render={breakdown['render_ms']:.2f})"
+                    )
+                else:
+                    print(
+                        f"  [{completed:>2}/{total}] {name}... "
+                        f"total={summary['mean_ms']:.2f}ms"
+                    )
+    for name, _ in CASES:
+        data = mmdr_data_by_case[name]
         results["mmdr"][name] = {
             **summarize(data["times"]),
             "breakdown": summarize_breakdowns(data["breakdowns"]),
             "memory_kb": data["memory_kb"],
         }
-        bd = results["mmdr"][name]["breakdown"]
-        if bd:
-            print(f"total={results['mmdr'][name]['mean_ms']:.2f}ms (parse={bd['parse_ms']:.2f} layout={bd['layout_ms']:.2f} render={bd['render_ms']:.2f})")
-        else:
-            print(f"total={results['mmdr'][name]['mean_ms']:.2f}ms")
+    runtime["mmdr_s"] = time.perf_counter() - phase_start
 
     if os.environ.get("SKIP_MERMAID_CLI"):
         print("SKIP_MERMAID_CLI set, skipping mermaid-cli")
+        runtime["mermaid_cli_s"] = 0.0
     else:
         print("\nBenchmarking mermaid-cli...")
-        for name, path in CASES:
-            print(f"  {name}...", end=" ", flush=True)
-            data = bench_mermaid_cli(path)
+        print(
+            "  sampling config: "
+            f"runs={MMD_CLI_RUNS}, warmup={MMD_CLI_WARMUP}, "
+            f"jobs={MMD_CLI_JOBS}, measure_memory={str(MMD_CLI_MEASURE_MEMORY).lower()}"
+        )
+        phase_start = time.perf_counter()
+        cli_data_by_case = {}
+        if MMD_CLI_JOBS <= 1:
+            for name, path in CASES:
+                print(f"  {name}...", end=" ", flush=True)
+                data = bench_mermaid_cli(path, mmdc_cache_state)
+                cli_data_by_case[name] = data
+                if data.get("error"):
+                    print(f"error={data['error']}")
+                else:
+                    cached_suffix = " (cached)" if data.get("cached") else ""
+                    print(
+                        f"total={summarize(data['times'])['mean_ms']:.2f}ms{cached_suffix}"
+                    )
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MMD_CLI_JOBS) as pool:
+                future_to_name = {
+                    pool.submit(bench_mermaid_cli, path, mmdc_cache_state): name
+                    for name, path in CASES
+                }
+                completed = 0
+                total = len(CASES)
+                for future in concurrent.futures.as_completed(future_to_name):
+                    name = future_to_name[future]
+                    data = future.result()
+                    cli_data_by_case[name] = data
+                    completed += 1
+                    if data.get("error"):
+                        print(f"  [{completed:>2}/{total}] {name}... error={data['error']}")
+                    else:
+                        cached_suffix = " (cached)" if data.get("cached") else ""
+                        print(
+                            f"  [{completed:>2}/{total}] {name}... "
+                            f"total={summarize(data['times'])['mean_ms']:.2f}ms{cached_suffix}"
+                        )
+
+        cache_hits = 0
+        cache_misses = 0
+        for name, _ in CASES:
+            data = cli_data_by_case.get(name, {})
+            cache_hits += int(data.get("cache_hit", 0))
+            cache_misses += int(data.get("cache_miss", 0))
             if data.get("error"):
                 results["mermaid_cli"][name] = {
                     "error": data["error"],
-                    "memory_kb": data["memory_kb"],
+                    "memory_kb": data.get("memory_kb"),
                 }
-                print(f"error={data['error']}")
             else:
                 results["mermaid_cli"][name] = {
                     **summarize(data["times"]),
-                    "memory_kb": data["memory_kb"],
+                    "memory_kb": data.get("memory_kb"),
                 }
-                print(f"total={results['mermaid_cli'][name]['mean_ms']:.2f}ms")
+        mmdc_cache_state["hits"] = cache_hits
+        mmdc_cache_state["misses"] = cache_misses
+        runtime["mermaid_cli_s"] = time.perf_counter() - phase_start
 
     # Print summary
     print("\n" + "=" * 70)
@@ -560,11 +895,71 @@ def main():
     print(f"\nWrote {out_json}")
 
     # Generate charts unless explicitly skipped
+    phase_start = time.perf_counter()
     if not os.environ.get("SKIP_CHARTS"):
         charts_dir = Path(os.environ.get("CHARTS_DIR", str(ROOT / "docs" / "benchmarks")))
         charts_dir.mkdir(parents=True, exist_ok=True)
         generate_svg_chart(results, charts_dir / "comparison_chart.svg")
         generate_breakdown_chart(results, charts_dir / "breakdown_chart.svg")
+    runtime["charts_s"] = time.perf_counter() - phase_start
+
+    if mmdc_cache_state.get("enabled"):
+        print(
+            "mermaid-cli cache: "
+            f"hits={mmdc_cache_state.get('hits', 0)} "
+            f"misses={mmdc_cache_state.get('misses', 0)} "
+            f"dir={mmdc_cache_state.get('dir')}"
+        )
+
+    runtime["history_s"] = 0.0
+    runtime["total_pre_history_s"] = time.perf_counter() - run_start
+    if not env_bool("NO_HISTORY_LOG"):
+        phase_start = time.perf_counter()
+        record = {
+            "timestamp_utc": iso_utc_now(),
+            "history_version": 1,
+            "tool": "bench_compare",
+            "cwd": str(ROOT),
+            "argv": sys.argv[1:],
+            "git": git_metadata(),
+            "host": host_metadata(),
+            "settings": {
+                "bin": BIN,
+                "mmd_cli": MMD_CLI,
+                "runs": RUNS,
+                "warmup": WARMUP,
+                "mmdr_jobs": MMDR_JOBS,
+                "mmdr_measure_memory": MMDR_MEASURE_MEMORY,
+                "mmd_cli_runs": MMD_CLI_RUNS,
+                "mmd_cli_warmup": MMD_CLI_WARMUP,
+                "mmd_cli_jobs": MMD_CLI_JOBS,
+                "mmd_cli_measure_memory": MMD_CLI_MEASURE_MEMORY,
+                "mmdc_config": MMDC_CONFIG,
+                "cases": [name for name, _ in CASES],
+                "skip_mermaid_cli": bool(os.environ.get("SKIP_MERMAID_CLI")),
+                "skip_charts": bool(os.environ.get("SKIP_CHARTS")),
+                "mmdc_cache_enabled": bool(mmdc_cache_state.get("enabled")),
+                "mmdc_cache_dir": str(mmdc_cache_state.get("dir")),
+                "mmdc_cache_hits": int(mmdc_cache_state.get("hits", 0)),
+                "mmdc_cache_misses": int(mmdc_cache_state.get("misses", 0)),
+                "out_json": str(out_json),
+                "charts_dir": str(Path(os.environ.get("CHARTS_DIR", str(ROOT / "docs" / "benchmarks")))),
+            },
+            "runtime": dict(runtime),
+            "summary": summarize_history(results),
+        }
+        append_benchmark_history(HISTORY_LOG, record)
+        runtime["history_s"] = time.perf_counter() - phase_start
+        print(f"Wrote history: {HISTORY_LOG}")
+    runtime["total_s"] = time.perf_counter() - run_start
+    print(
+        "runtime breakdown (s): "
+        f"mmdr={runtime.get('mmdr_s', 0.0):.2f}, "
+        f"mermaid-cli={runtime.get('mermaid_cli_s', 0.0):.2f}, "
+        f"charts={runtime.get('charts_s', 0.0):.2f}, "
+        f"history={runtime.get('history_s', 0.0):.2f}, "
+        f"total={runtime.get('total_s', 0.0):.2f}"
+    )
 
 
 if __name__ == "__main__":

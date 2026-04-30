@@ -73,7 +73,8 @@ python3 scripts/priority_bench.py --pattern flowchart --weight-mode manual
 The script writes a machine-readable report to `target/priority-bench.json` and prints:
 - top fixtures by quality pain
 - top quick wins by pain-per-layout-millisecond
-- top fixtures by space inefficiency (wasted space, component gap, center offset)
+- top fixtures by space inefficiency (large-diagram-weighted wasted space, component gap, center offset)
+- per-fixture crossing density (`cross/edge`) to normalize readability hotspots across diagram sizes
 
 Recent stress fixtures for visual quality include:
 - `benches/fixtures/flowchart_ports_heavy.mmd`
@@ -92,6 +93,16 @@ Recent stress fixtures for visual quality include:
 - `benches/fixtures/flowchart_component_packing.mmd`
 - `benches/fixtures/flowchart_direction_conflict.mmd`
 - `benches/fixtures/flowchart_parallel_label_stack.mmd`
+- `benches/fixtures/flowchart_port_alignment_matrix.mmd`
+- `benches/fixtures/flowchart_path_occlusion_maze.mmd`
+- `benches/fixtures/flowchart_subgraph_boundary_intrusion.mmd`
+- `benches/fixtures/flowchart_parallel_edges_bundle.mmd`
+- `benches/fixtures/flowchart_flow_direction_backtrack.mmd`
+- `benches/fixtures/flowchart_mega_multihub_control.mmd`
+- `benches/fixtures/flowchart_mega_crosslane_subgraphs.mmd`
+- `benches/fixtures/flowchart_mega_braid_feedback.mmd`
+- `benches/fixtures/flowchart_mega_event_mesh.mmd`
+- `benches/fixtures/flowchart_mega_nested_regions.mmd`
 
 Latest flowchart quality compare (`scripts/quality_bench.py --engine both --pattern flowchart`, February 6, 2026):
 - `mmdr`: 30 fixtures, average weighted score `435.06`
@@ -109,3 +120,149 @@ Recent layout/readability fixes validated by these runs:
   - class multiplicity edge-span relaxation (removed multiplicity label-label overlap in `tests/fixtures/class/multiplicity.mmd`)
   - tiny-cycle overlap resolution (removed node overlap and label overlap in `tests/fixtures/flowchart/cycles.mmd`)
   - chain-aware top-level subgraph wrapping for very large flowcharts (`benches/fixtures/flowchart_large.mmd` aspect elongation `153.63 -> 1.71`, wasted space `0.286 -> 0.071`).
+- `label_overlap_count` now ignores tiny text-box slivers (`<= 10px²`) to
+  reduce host/font jitter noise in cross-machine comparisons.
+
+## Benchmark History Logging
+
+`scripts/quality_bench.py` now appends a JSONL run history record by default:
+- file: `tmp/benchmark-history/quality-runs.jsonl`
+- metadata: timestamp, CLI args, fixture/pattern selection, host info, git commit SHA, branch, dirty state
+- summaries: average scores and comparison/dominance stats (for `--engine both`)
+
+Disable per run if needed:
+
+```bash
+python3 scripts/quality_bench.py --engine both --no-history-log
+```
+
+Mermaid-cli caching is enabled by default for `quality_bench.py` and
+`label_bench.py`:
+- cache dir: `tmp/benchmark-cache/mmdc`
+- cache key inputs: fixture contents, config contents, mermaid-cli command,
+  mermaid-cli version, and benchmark script revision
+
+Useful flags:
+
+```bash
+python3 scripts/quality_bench.py --engine both --mmdc-cache-dir tmp/benchmark-cache/mmdc
+python3 scripts/quality_bench.py --engine both --no-mmdc-cache
+python3 scripts/label_bench.py --engine both --no-mmdc-cache
+```
+
+## Label Path-Gap Benchmark
+
+To benchmark edge-label placement directly, use:
+
+```bash
+python3 scripts/label_bench.py --engine both --pattern flowchart
+```
+
+This benchmark reports `edge_label_path_gap_*` metrics where:
+- `edge_label_path_gap_mean`: average label-box to nearest edge-path gap
+- `edge_label_path_gap_p95`: 95th percentile gap
+- `edge_label_path_touch_ratio`: fraction of labels touching their nearest edge path (`0` gap)
+- `edge_label_path_non_touch_ratio`: fraction of labels not touching their nearest edge path (`1 - touch_ratio`)
+- `edge_label_path_optimal_gap_score_mean`: average optimal-gap quality score in `[0,1]`
+  where `1` means diagram-specific ideal clearance from the edge path
+- `edge_label_path_too_close_ratio`: fraction of labels that are too close to the path
+  (for sequence diagrams, this captures line-through-label cases)
+- `edge_label_path_in_band_ratio`: fraction of labels in the diagram-specific target clearance band
+- `edge_label_path_gap_bad_ratio`: fraction of labels beyond diagram-specific gap thresholds
+
+Scoring model notes:
+- Sequence diagrams use label-kind-aware clearance targets:
+  center message labels prefer a stable positive offset above the path, while
+  start/end endpoint labels use a smaller near-path target.
+- Flowchart/class/state/ER keep a near-path target band by default.
+- Sequence benchmark summaries and threshold checks prefer owned edge-label
+  metrics when mapping coverage is high, reducing false positives from
+  unrelated nearby message lines.
+
+## Large-Diagram Space Benchmark
+
+To prioritize whitespace waste only when diagrams are large, use:
+
+```bash
+python3 scripts/priority_bench.py --pattern flowchart --top 10
+```
+
+Key large-space metrics:
+- `large_diagram_space_weight`: `0..1` scale factor (near `0` for small diagrams)
+- `wasted_space_large_ratio`: `wasted_space_ratio * large_diagram_space_weight`
+- `space_efficiency_large_penalty`: `space_efficiency_penalty * large_diagram_space_weight`
+- `component_gap_large_ratio`: `component_gap_ratio * large_diagram_space_weight`
+
+`priority_bench` now ranks “space inefficiency” using these large-diagram-weighted
+terms first, so small fixtures do not dominate whitespace regressions.
+It also prints a dedicated section: `Top by large-diagram unused space`.
+
+Optional quality gates in `quality_bench.py`:
+
+```bash
+python3 scripts/quality_bench.py \
+  --engine mmdr \
+  --max-sequence-too-close 0.05 \
+  --max-large-space-ratio 0.20 \
+  --max-flowchart-crossings-per-edge 1.50 \
+  --min-large-space-weight 0.25
+```
+
+- `--max-sequence-too-close`: fails if any sequence fixture exceeds the ratio,
+  preferring explicitly owned edge-label mapping metrics when available.
+- `--max-large-space-ratio`: fails if any sufficiently large fixture exceeds weighted waste.
+- `--max-flowchart-crossings-per-edge`: fails if large flowcharts exceed crossing density.
+- `--min-large-space-weight`: excludes small diagrams from the large-space gate.
+
+Candidate selection details:
+- If explicit edge-label boxes are present in SVG, only those boxes are scored.
+- Sequence rendering now emits explicit `.edgeLabel` rectangles for message labels
+  (in addition to text) so sequence path-gap metrics are measured against the
+  rendered label box geometry instead of inferred text-only bounds.
+- Fallback text-label scoring is enabled only for fixtures that appear to contain
+  explicit edge labels in source syntax.
+- Sequence fallback candidates are capped to the expected message-label count and
+  ranked by nearest-path gap to avoid actor/footbox text polluting label metrics.
+
+Run history for this benchmark is also logged by default to:
+- `tmp/benchmark-history/label-runs.jsonl`
+
+`scripts/priority_bench.py` now appends run history by default to:
+- `tmp/benchmark-history/priority-runs.jsonl`
+
+`scripts/bench_compare.py` now appends run history by default to:
+- `tmp/benchmark-history/bench-compare-runs.jsonl`
+
+`scripts/bench_compare.py` also supports mermaid-cli result caching by default
+to avoid rerunning slow CLI loops on unchanged inputs:
+- cache dir default: `tmp/benchmark-cache/bench-compare/mmdc`
+- cache key inputs: fixture contents, mermaid-cli command + version, bench
+  sampling settings (`MMD_CLI_RUNS`, `MMD_CLI_WARMUP`), and optional
+  `MMDC_CONFIG`
+- default mermaid-cli sampling is lightweight for speed:
+  `MMD_CLI_RUNS=1`, `MMD_CLI_WARMUP=0` (override as needed)
+- mermaid-cli execution is parallelized by default with
+  `MMD_CLI_JOBS=min(4, cpu_count)`; set `MMD_CLI_JOBS=1` for serial runs
+- when `MMD_CLI_WARMUP=0`, bench runs do not perform an extra preflight CLI
+  invocation, so cold runtime scales with measured run count only
+- mermaid-cli memory probing is opt-in (`MMD_CLI_MEASURE_MEMORY=1`) because it
+  adds an extra CLI execution per case
+- mmdr memory probing is also opt-in (`MMDR_MEASURE_MEMORY=1`) because it adds
+  one extra mmdr execution per case
+- each run prints a runtime breakdown (`mmdr`, `mermaid-cli`, charts, history,
+  total) and writes runtime fields into bench history records
+
+Useful environment knobs:
+
+```bash
+MMDC_CACHE_DIR=tmp/benchmark-cache/bench-compare/mmdc python3 scripts/bench_compare.py
+NO_MMDC_CACHE=1 python3 scripts/bench_compare.py
+MMDC_CONFIG=tests/fixtures/modern-config.json python3 scripts/bench_compare.py
+MMD_CLI_RUNS=5 MMD_CLI_WARMUP=1 python3 scripts/bench_compare.py
+MMD_CLI_JOBS=1 python3 scripts/bench_compare.py
+MMD_CLI_JOBS=4 python3 scripts/bench_compare.py
+MMD_CLI_MEASURE_MEMORY=1 python3 scripts/bench_compare.py
+MMDR_MEASURE_MEMORY=1 python3 scripts/bench_compare.py
+```
+
+Each history record includes timestamp, git commit/branch/dirty state, host metadata, run settings, and summary metrics.

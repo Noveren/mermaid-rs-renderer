@@ -21,6 +21,10 @@ STRICT_METRICS = {
     "label_edge_overlap_count",
     "label_out_of_bounds_count",
     "edge_label_alignment_bad_count",
+    "edge_label_path_gap_bad_count",
+    "edge_label_owned_path_non_touch_ratio",
+    "edge_label_owned_path_gap_bad_ratio",
+    "edge_label_owned_anchor_offset_bad_ratio",
 }
 
 RELATIVE_METRICS = {
@@ -34,6 +38,36 @@ RELATIVE_METRICS = {
     "svg_edge_overlap_length",
     "arrow_path_overlap_length",
     "edge_node_near_miss_count",
+    "edge_node_crossing_length",
+    "edge_node_crossing_length_per_edge",
+    "subgraph_boundary_intrusion_pairs",
+    "subgraph_boundary_intrusion_ratio",
+    "subgraph_boundary_intrusion_length",
+    "subgraph_boundary_intrusion_length_per_edge",
+    "port_target_side_mismatch_count",
+    "port_target_side_mismatch_ratio",
+    "port_direction_misalignment_count",
+    "port_direction_misalignment_ratio",
+    "endpoint_boundary_error_mean",
+    "endpoint_off_boundary_count",
+    "endpoint_off_boundary_ratio",
+    "parallel_edge_pair_count",
+    "parallel_edge_overlap_pair_count",
+    "parallel_edge_overlap_pair_ratio",
+    "parallel_edge_overlap_ratio_mean",
+    "parallel_edge_separation_mean",
+    "parallel_edge_separation_bad_count",
+    "parallel_edge_separation_bad_ratio",
+    "parallel_edge_separation_threshold",
+    "flow_forward_length",
+    "flow_backtrack_length",
+    "flow_lateral_length",
+    "flow_backtrack_ratio",
+    "flow_monotonicity_score",
+    "flow_monotonic_edge_count",
+    "flow_backtracking_edge_count",
+    "flow_backtracking_edge_ratio",
+    "flow_lateral_ratio",
     "node_spacing_violation_count",
     "node_spacing_violation_severity",
     "avg_edge_detour_ratio",
@@ -58,6 +92,14 @@ RELATIVE_METRICS = {
     "edge_label_alignment_mean",
     "edge_label_alignment_p95",
     "edge_label_alignment_bad_ratio",
+    "edge_label_path_gap_mean",
+    "edge_label_path_gap_p95",
+    "edge_label_path_clearance_penalty",
+    "edge_label_path_gap_bad_ratio",
+    "edge_label_owned_path_gap_mean",
+    "edge_label_owned_path_gap_p95",
+    "edge_label_owned_path_clearance_penalty",
+    "edge_label_owned_anchor_offset_px_mean",
     "node_overlap_area",
     "score",
 }
@@ -117,6 +159,8 @@ def build_release(bin_path: Path):
 
 
 def layout_key(path: Path, base: Path) -> str:
+    path = Path(path).resolve()
+    base = Path(base).resolve()
     try:
         rel = path.relative_to(base)
     except ValueError:

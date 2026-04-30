@@ -17,7 +17,7 @@ static INIT_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^%%\{\s*init\s*:\s*(\{.*\})\s*\}%%").unwrap());
 static PIPE_LABEL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"^(?P<left>.+?)\s*(?P<arrow><[-.=ox]*[-=]+[-.=ox]*>|<[-.=ox]*[-=]+|[-.=ox]*[-=]+>|[-.=ox]*[-=]+)\|(?P<label>.+?)\|\s*(?P<right>.+)$",
+        r"^(?P<left>.+?)\s*(?P<arrow><[-.=ox]*[-=]+[-.=ox]*>|<[-.=ox]*[-=]+[-.=ox]*|[-.=ox]*[-=]+[-.=ox]*>|[-.=ox]*[-=]+[-.=ox]*)\|(?P<label>.+?)\|\s*(?P<right>.+)$",
     )
     .unwrap()
 });
@@ -41,12 +41,12 @@ static COMPACT_DOTTED_LABEL_ARROW_RE: Lazy<Regex> = Lazy::new(|| {
 });
 static ARROW_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"^(?P<left>.+?)\s*(?P<arrow><[-.=ox]*[-=]+[-.=ox]*>|<[-.=ox]*[-=]+|[-.=ox]*[-=]+>|[-.=ox]*[-=]+)\s*(?P<right>.+)$",
+        r"^(?P<left>.+?)\s*(?P<arrow><[-.=ox]*[-=]+[-.=ox]*>|<[-.=ox]*[-=]+[-.=ox]*|[-.=ox]*[-=]+[-.=ox]*>|[-.=ox]*[-=]+[-.=ox]*)\s*(?P<right>.+)$",
     )
     .unwrap()
 });
 static ARROW_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"<[-.=ox]*[-=]+[-.=ox]*>|<[-.=ox]*[-=]+|[-.=ox]*[-=]+>|[-.=ox]*[-=]+").unwrap()
+    Regex::new(r"<[-.=ox]*[-=]+[-.=ox]*>|<[-.=ox]*[-=]+[-.=ox]*|[-.=ox]*[-=]+[-.=ox]*>|[-.=ox]*[-=]+[-.=ox]*").unwrap()
 });
 
 #[derive(Debug, Default)]
@@ -364,33 +364,33 @@ fn parse_flowchart(input: &str) -> Result<ParseOutput> {
 }
 
 /// Split on `&` that is outside brackets, parens, braces, and quotes.
-fn split_ampersand_aware(input: &str) -> Vec<&str> {
-    let masked = mask_bracket_content(input);
-    let mut parts = Vec::new();
-    let mut start = 0;
-    for (i, ch) in masked.char_indices() {
-        if ch == '&' {
-            let part = input[start..i].trim();
-            if !part.is_empty() {
-                parts.push(part);
-            }
-            start = i + 1;
-        }
-    }
-    let last = input[start..].trim();
-    if !last.is_empty() {
-        parts.push(last);
-    }
-    parts
-}
+// fn split_ampersand_aware(input: &str) -> Vec<&str> {
+//     let masked = mask_bracket_content(input);
+//     let mut parts = Vec::new();
+//     let mut start = 0;
+//     for (i, ch) in masked.char_indices() {
+//         if ch == '&' {
+//             let part = input[start..i].trim();
+//             if !part.is_empty() {
+//                 parts.push(part);
+//             }
+//             start = i + 1;
+//         }
+//     }
+//     let last = input[start..].trim();
+//     if !last.is_empty() {
+//         parts.push(last);
+//     }
+//     parts
+// }
 
 fn add_flowchart_edge(line: &str, graph: &mut Graph, subgraph_stack: &[usize]) -> bool {
     let Some((left, label, right, edge_meta)) = parse_edge_line(line) else {
         return false;
     };
 
-    let sources = split_ampersand_aware(&left);
-    let targets = split_ampersand_aware(&right);
+    let sources = split_on_ampersand(&left);
+    let targets = split_on_ampersand(&right);
 
     let mut source_ids = Vec::new();
     for source in sources {
@@ -789,6 +789,43 @@ fn parse_state_description_line(line: &str) -> Option<(String, String, Vec<Strin
     Some((id, desc, classes))
 }
 
+fn state_display_label(
+    id: &str,
+    labels: &HashMap<String, String>,
+    descriptions: &HashMap<String, Vec<String>>,
+) -> String {
+    let title = labels.get(id).map(String::as_str).unwrap_or(id);
+    let Some(descriptions) = descriptions.get(id) else {
+        return title.to_string();
+    };
+    if descriptions.is_empty() {
+        return title.to_string();
+    }
+
+    let mut label = String::with_capacity(
+        title.len() + descriptions.iter().map(String::len).sum::<usize>() + descriptions.len() + 4,
+    );
+    label.push_str(title);
+    label.push_str("\n---");
+    for description in descriptions {
+        label.push('\n');
+        label.push_str(description);
+    }
+    label
+}
+
+fn state_display_label_option(
+    id: &str,
+    labels: &HashMap<String, String>,
+    descriptions: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    if labels.contains_key(id) || descriptions.contains_key(id) {
+        Some(state_display_label(id, labels, descriptions))
+    } else {
+        None
+    }
+}
+
 fn parse_state_id_with_classes(input: &str) -> (String, Vec<String>) {
     let (base, classes) = split_inline_classes(input);
     (strip_quotes(base.trim()), classes)
@@ -859,16 +896,19 @@ fn edge_meta_from_state_token(token: &str) -> EdgeMeta {
 fn normalize_state_token(
     token: &str,
     is_start: bool,
-    start_counter: &mut usize,
+    start_states: &mut HashMap<String, String>,
     end_states: &mut HashMap<String, String>,
     scope: &str,
 ) -> (String, crate::ir::NodeShape, Option<String>) {
     let trimmed = token.trim();
     if trimmed == "[*]" || trimmed == "*" {
         let (id, shape) = if is_start {
-            // Start states are unique - each [*] --> X creates a new start node
-            let id = format!("__start_{}__", *start_counter);
-            *start_counter += 1;
+            // Start states are shared per scope. This lets fan-out/fan-in
+            // patterns be recognized and rendered as fork/join bars.
+            let id = start_states
+                .entry(scope.to_string())
+                .or_insert_with(|| format!("__start_{}__", scope))
+                .clone();
             (id, crate::ir::NodeShape::Circle)
         } else {
             // End states are shared per scope - all X --> [*] in same scope go to same node
@@ -1921,10 +1961,10 @@ fn parse_journey_diagram(input: &str) -> Result<ParseOutput> {
                 Some(node_label),
                 Some(crate::ir::NodeShape::Rectangle),
             );
-            if let Some(score) = score {
-                if let Some(node) = graph.nodes.get_mut(&node_id) {
-                    node.value = Some(score);
-                }
+            if let Some(score) = score
+                && let Some(node) = graph.nodes.get_mut(&node_id)
+            {
+                node.value = Some(score);
             }
             if let Some(idx) = current_section
                 && let Some(subgraph) = graph.subgraphs.get_mut(idx)
@@ -2080,14 +2120,13 @@ fn extract_frontmatter_value(input: &str, key: &str) -> Option<String> {
             in_frontmatter = true;
             continue;
         }
-        if in_frontmatter {
-            if let Some((k, v)) = trimmed.split_once(':') {
-                if k.trim() == key {
-                    let val = v.trim().to_string();
-                    if !val.is_empty() {
-                        return Some(val);
-                    }
-                }
+        if in_frontmatter
+            && let Some((k, v)) = trimmed.split_once(':')
+            && k.trim() == key
+        {
+            let val = v.trim().to_string();
+            if !val.is_empty() {
+                return Some(val);
             }
         }
     }
@@ -3602,8 +3641,8 @@ fn parse_block_diagram(input: &str) -> Result<ParseOutput> {
             continue;
         }
         if let Some((left, label, right, edge_meta)) = parse_edge_line(line) {
-            let sources = split_ampersand_aware(&left);
-            let targets = split_ampersand_aware(&right);
+            let sources = split_on_ampersand(&left);
+            let targets = split_on_ampersand(&right);
 
             for source in &sources {
                 let (source_id, source_label, source_shape, source_classes) =
@@ -3688,9 +3727,9 @@ fn parse_block_diagram(input: &str) -> Result<ParseOutput> {
         }
     }
 
-    if !block.nodes.is_empty() || block.columns.is_some() {
-        graph.block = Some(block);
-    }
+    // Keep block metadata even when the DSL only contains edge lines.
+    // The layout stage infers an implicit grid from graph topology in that case.
+    graph.block = Some(block);
 
     Ok(ParseOutput { graph, init_config })
 }
@@ -3836,15 +3875,15 @@ fn parse_architecture_diagram(input: &str) -> Result<ParseOutput> {
                         label: label.clone(),
                         nodes: Vec::new(),
                         direction: None,
-                        icon: icon,
+                        icon,
                     });
                     groups.insert(id, graph.subgraphs.len() - 1);
                 } else {
                     graph.ensure_node(&id, Some(label), Some(crate::ir::NodeShape::Rectangle));
-                    if let Some(icon_type) = icon {
-                        if let Some(node) = graph.nodes.get_mut(&id) {
-                            node.icon = Some(icon_type);
-                        }
+                    if let Some(icon_type) = icon
+                        && let Some(node) = graph.nodes.get_mut(&id)
+                    {
+                        node.icon = Some(icon_type);
                     }
                     if let Some(parent_id) = parent
                         && let Some(idx) = groups.get(&parent_id).copied()
@@ -3902,11 +3941,9 @@ fn parse_architecture_node(
     };
     let id_part = node_part.split('[').next().unwrap_or(node_part).trim();
     let icon = if let Some(paren_start) = id_part.find('(') {
-        if let Some(paren_end) = id_part.find(')') {
-            Some(id_part[paren_start + 1..paren_end].trim().to_string())
-        } else {
-            None
-        }
+        id_part
+            .find(')')
+            .map(|paren_end| id_part[paren_start + 1..paren_end].trim().to_string())
     } else {
         None
     };
@@ -4296,7 +4333,8 @@ fn parse_state_diagram(input: &str) -> Result<ParseOutput> {
     let (lines, init_config) = preprocess_input(input)?;
 
     let mut labels: HashMap<String, String> = HashMap::new();
-    let mut start_counter: usize = 0;
+    let mut descriptions: HashMap<String, Vec<String>> = HashMap::new();
+    let mut start_states: HashMap<String, String> = HashMap::new();
     let mut end_states: HashMap<String, String> = HashMap::new();
     let mut subgraph_stack: Vec<usize> = Vec::new();
     let mut region_counter: usize = 0;
@@ -4461,7 +4499,7 @@ fn parse_state_diagram(input: &str) -> Result<ParseOutput> {
                 labels.insert(id.clone(), label);
                 graph.ensure_node(
                     &id,
-                    labels.get(&id).cloned(),
+                    Some(state_display_label(&id, &labels, &descriptions)),
                     state_shape.or(Some(crate::ir::NodeShape::RoundRect)),
                 );
                 apply_node_classes(&mut graph, &id, &classes);
@@ -4482,20 +4520,22 @@ fn parse_state_diagram(input: &str) -> Result<ParseOutput> {
                 let (left_id, left_shape, left_label_override) = normalize_state_token(
                     &left_token,
                     true,
-                    &mut start_counter,
+                    &mut start_states,
                     &mut end_states,
                     &scope,
                 );
                 let (right_id, right_shape, right_label_override) = normalize_state_token(
                     &right_token,
                     false,
-                    &mut start_counter,
+                    &mut start_states,
                     &mut end_states,
                     &scope,
                 );
 
-                let left_label = left_label_override.or_else(|| labels.get(&left_id).cloned());
-                let right_label = right_label_override.or_else(|| labels.get(&right_id).cloned());
+                let left_label = left_label_override
+                    .or_else(|| state_display_label_option(&left_id, &labels, &descriptions));
+                let right_label = right_label_override
+                    .or_else(|| state_display_label_option(&right_id, &labels, &descriptions));
                 let left_shape = if left_shape == crate::ir::NodeShape::RoundRect
                     && graph.nodes.contains_key(&left_id)
                 {
@@ -4538,10 +4578,10 @@ fn parse_state_diagram(input: &str) -> Result<ParseOutput> {
 
             if let Some((id, label, classes)) = parse_state_description_line(line) {
                 let label = label_override.clone().unwrap_or(label);
-                labels.insert(id.clone(), label);
+                descriptions.entry(id.clone()).or_default().push(label);
                 graph.ensure_node(
                     &id,
-                    labels.get(&id).cloned(),
+                    Some(state_display_label(&id, &labels, &descriptions)),
                     state_shape.or(Some(crate::ir::NodeShape::RoundRect)),
                 );
                 apply_node_classes(&mut graph, &id, &classes);
@@ -4560,7 +4600,11 @@ fn parse_state_diagram(input: &str) -> Result<ParseOutput> {
                 } else {
                     Some(crate::ir::NodeShape::RoundRect)
                 };
-                graph.ensure_node(&target, labels.get(&target).cloned(), shape);
+                graph.ensure_node(
+                    &target,
+                    state_display_label_option(&target, &labels, &descriptions),
+                    shape,
+                );
                 apply_node_classes(&mut graph, &target, &classes);
                 graph.state_notes.push(crate::ir::StateNote {
                     position,
@@ -4578,7 +4622,7 @@ fn parse_state_diagram(input: &str) -> Result<ParseOutput> {
                 }
                 graph.ensure_node(
                     &id,
-                    labels.get(&id).cloned(),
+                    state_display_label_option(&id, &labels, &descriptions),
                     state_shape.or(Some(crate::ir::NodeShape::RoundRect)),
                 );
                 apply_node_classes(&mut graph, &id, &classes);
@@ -4586,6 +4630,46 @@ fn parse_state_diagram(input: &str) -> Result<ParseOutput> {
                 record_region_node(&mut composite_stack, &id);
                 continue;
             }
+        }
+    }
+
+    // Convert scoped [*] fan-out/fan-in nodes into fork/join bars.
+    let mut outgoing_counts: HashMap<&str, usize> = HashMap::new();
+    let mut incoming_counts: HashMap<&str, usize> = HashMap::new();
+    for edge in &graph.edges {
+        *outgoing_counts.entry(edge.from.as_str()).or_insert(0) += 1;
+        *incoming_counts.entry(edge.to.as_str()).or_insert(0) += 1;
+    }
+    let fork_ids: Vec<String> = start_states
+        .iter()
+        .filter_map(|(scope, id)| {
+            if scope == "root" {
+                return None;
+            }
+            if outgoing_counts.get(id.as_str()).copied().unwrap_or(0) > 1 {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let join_ids: Vec<String> = end_states
+        .iter()
+        .filter_map(|(scope, id)| {
+            if scope == "root" {
+                return None;
+            }
+            if incoming_counts.get(id.as_str()).copied().unwrap_or(0) > 1 {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for id in fork_ids.into_iter().chain(join_ids) {
+        if let Some(node) = graph.nodes.get_mut(&id) {
+            node.shape = crate::ir::NodeShape::ForkJoin;
+            node.label.clear();
         }
     }
 
@@ -5156,6 +5240,31 @@ fn mask_bracket_content(line: &str) -> String {
         prev_char = ch;
     }
     result
+}
+
+/// Split `input` on `&` that appear outside brackets, parentheses, braces, and quotes.
+///
+/// Uses [`mask_bracket_content`] to blank out quoted/bracketed content while
+/// preserving byte positions, then splits on `&` positions found in the masked
+/// string but slices from the original — so `A["foo & bar"]` is never split.
+fn split_on_ampersand(input: &str) -> Vec<&str> {
+    let masked = mask_bracket_content(input);
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    for (i, ch) in masked.char_indices() {
+        if ch == '&' {
+            let part = input[start..i].trim();
+            if !part.is_empty() {
+                parts.push(part);
+            }
+            start = i + ch.len_utf8();
+        }
+    }
+    let last = input[start..].trim();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+    parts
 }
 
 fn split_edge_chain(line: &str) -> Option<Vec<String>> {
@@ -5896,6 +6005,52 @@ mod tests {
     use crate::ir::DiagramKind;
 
     #[test]
+    fn split_on_ampersand_plain() {
+        assert_eq!(split_on_ampersand("A & B & C"), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn split_on_ampersand_preserves_label_ampersand() {
+        let parts = split_on_ampersand(r#"A["foo & bar"]"#);
+        assert_eq!(parts, vec![r#"A["foo & bar"]"#]);
+    }
+
+    #[test]
+    fn split_on_ampersand_mixed() {
+        let parts = split_on_ampersand(r#"A["foo & bar"] & B"#);
+        assert_eq!(parts, vec![r#"A["foo & bar"]"#, "B"]);
+    }
+
+    #[test]
+    fn parse_ampersand_in_node_label_not_split() {
+        let input = r#"flowchart LR
+A["reads artifacts & computes deps"] --> B"#;
+        let parsed = parse_mermaid(input).unwrap();
+        assert_eq!(
+            parsed.graph.nodes.len(),
+            2,
+            "ampersand in label must not create extra nodes"
+        );
+        assert_eq!(parsed.graph.edges.len(), 1);
+        assert!(parsed.graph.nodes.contains_key("A"));
+        assert!(parsed.graph.nodes.contains_key("B"));
+        assert_eq!(
+            parsed.graph.nodes["A"].label,
+            "reads artifacts & computes deps"
+        );
+    }
+
+    #[test]
+    fn parse_parallel_ampersand_with_label_ampersand() {
+        let input = r#"flowchart LR
+A["foo & bar"] & B --> C"#;
+        let parsed = parse_mermaid(input).unwrap();
+        assert_eq!(parsed.graph.edges.len(), 2, "two parallel edges expected");
+        assert_eq!(parsed.graph.nodes.len(), 3);
+        assert_eq!(parsed.graph.nodes["A"].label, "foo & bar");
+    }
+
+    #[test]
     fn parse_simple_flowchart() {
         let input = "flowchart lr\nA[Start] -->|go| B(End)";
         let parsed = parse_mermaid(input).unwrap();
@@ -5939,9 +6094,9 @@ mod tests {
         assert_eq!(parsed.graph.edges.len(), 4);
         assert_eq!(parsed.graph.edges[0].style, crate::ir::EdgeStyle::Dotted);
         assert_eq!(parsed.graph.edges[1].style, crate::ir::EdgeStyle::Thick);
-        assert_eq!(parsed.graph.edges[2].arrow_start, true);
-        assert_eq!(parsed.graph.edges[2].arrow_end, true);
-        assert_eq!(parsed.graph.edges[3].directed, false);
+        assert!(parsed.graph.edges[2].arrow_start);
+        assert!(parsed.graph.edges[2].arrow_end);
+        assert!(!parsed.graph.edges[3].directed);
         let style = parsed.graph.edge_styles.get(&0).unwrap();
         assert_eq!(style.label_color.as_deref(), Some("#f00"));
     }
@@ -6028,6 +6183,39 @@ mod tests {
         assert!(parsed.graph.nodes.contains_key("D2"));
         assert!(!parsed.graph.nodes.contains_key("risk"));
         assert!(!parsed.graph.nodes.contains_key("|high"));
+    }
+
+    #[test]
+    fn parse_pipe_edge_label_with_cross_decoration() {
+        let input = "graph TD;A--x|text including URL space|B;";
+        let parsed = parse_mermaid(input).unwrap();
+        assert_eq!(parsed.graph.edges.len(), 1);
+        assert_eq!(
+            parsed.graph.edges[0].label.as_deref(),
+            Some("text including URL space")
+        );
+        assert_eq!(
+            parsed.graph.edges[0].end_decoration,
+            Some(crate::ir::EdgeDecoration::Cross)
+        );
+        assert!(parsed.graph.nodes.contains_key("A"));
+        assert!(parsed.graph.nodes.contains_key("B"));
+        assert!(!parsed.graph.nodes.contains_key("x|text"));
+    }
+
+    #[test]
+    fn parse_pipe_edge_label_with_circle_decoration() {
+        let input = "graph TD;A--o|text space|B;";
+        let parsed = parse_mermaid(input).unwrap();
+        assert_eq!(parsed.graph.edges.len(), 1);
+        assert_eq!(parsed.graph.edges[0].label.as_deref(), Some("text space"));
+        assert_eq!(
+            parsed.graph.edges[0].end_decoration,
+            Some(crate::ir::EdgeDecoration::Circle)
+        );
+        assert!(parsed.graph.nodes.contains_key("A"));
+        assert!(parsed.graph.nodes.contains_key("B"));
+        assert!(!parsed.graph.nodes.contains_key("o|text"));
     }
 
     #[test]
@@ -6462,7 +6650,18 @@ A["foo & bar"] & B --> C"#;
         let input = "stateDiagram-v2\nstate Idle : Waiting\nIdle --> Done";
         let parsed = parse_mermaid(input).unwrap();
         let node = parsed.graph.nodes.get("Idle").unwrap();
-        assert_eq!(node.label, "Waiting");
+        assert_eq!(node.label, "Idle\n---\nWaiting");
+    }
+
+    #[test]
+    fn parse_state_descriptions_preserve_title_and_accumulate() {
+        let input = "stateDiagram-v2\nCLOSED --> OPEN : fail\nCLOSED : All DB calls pass through\nCLOSED : Counting consecutive failures";
+        let parsed = parse_mermaid(input).unwrap();
+        let node = parsed.graph.nodes.get("CLOSED").unwrap();
+        assert_eq!(
+            node.label,
+            "CLOSED\n---\nAll DB calls pass through\nCounting consecutive failures"
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@
 
 </div>
 
+> **Note:** This library is under active early development. Visual output quality is improving rapidly but may not yet match mermaid-cli in all cases. Bug reports and PRs are welcome.
+
 ## Performance
 
 mmdr renders diagrams **100–1400x faster** than mermaid-cli by eliminating browser overhead.
@@ -115,6 +117,9 @@ mmdr parses Mermaid syntax natively in Rust and renders directly to SVG. No brow
 ## Installation
 
 ```bash
+# crates.io (recommended)
+cargo install mermaid-rs-renderer
+
 # From source
 cargo install --path .
 
@@ -299,7 +304,10 @@ Supported:
 ```bash
 mmdr -i diagram.mmd -o out.svg -c config.json
 mmdr -i diagram.mmd -o out.svg --nodeSpacing 60 --rankSpacing 120
+mmdr -i diagram.mmd -o out.svg --preferredAspectRatio 16:9
 ```
+
+`preferredAspectRatio` is layout-aware for graph diagrams: the renderer first rebalances geometry toward the target ratio, then fits final SVG dimensions to that ratio.
 
 <details>
 <summary><strong>config.json example</strong></summary>
@@ -320,6 +328,7 @@ mmdr -i diagram.mmd -o out.svg --nodeSpacing 60 --rankSpacing 120
     "fontFamily": "Inter, system-ui, sans-serif",
     "fontSize": 13
   },
+  "preferredAspectRatio": "16:9",
   "flowchart": {
     "nodeSpacing": 50,
     "rankSpacing": 50
@@ -358,7 +367,7 @@ Use mmdr as a Rust library in your project:
 
 ```toml
 [dependencies]
-mermaid-rs-renderer = { git = "https://github.com/1jehuang/mermaid-rs-renderer", tag = "v0.2.0" }
+mermaid-rs-renderer = "0.2.0"
 ```
 
 <details>
@@ -368,7 +377,7 @@ For tools like Zola that only need SVG rendering, disable default features to av
 
 ```toml
 [dependencies]
-mermaid-rs-renderer = { git = "https://github.com/1jehuang/mermaid-rs-renderer", tag = "v0.2.0", default-features = false }
+mermaid-rs-renderer = { version = "0.2.0", default-features = false }
 ```
 
 | Feature | Default | Description |
@@ -379,6 +388,13 @@ mermaid-rs-renderer = { git = "https://github.com/1jehuang/mermaid-rs-renderer",
 This reduces dependencies from ~180 to ~80 crates.
 
 </details>
+
+For unreleased commits only:
+
+```toml
+[dependencies]
+mermaid-rs-renderer = { git = "https://github.com/1jehuang/mermaid-rs-renderer", rev = "<commit-sha>" }
+```
 
 ```rust
 use mermaid_rs_renderer::{render, render_with_options, RenderOptions};
@@ -447,20 +463,26 @@ cargo run -- -i docs/diagrams/architecture.mmd -o /tmp/out.svg -e svg
 
 **Remote build/test over SSH (optional):**
 ```bash
-export MMDR_REMOTE_HOST=<your-ssh-host-alias>
 scripts/remote-cargo.sh test
 scripts/remote-cargo.sh build --release
 scripts/remote-cargo.sh bench --bench renderer
+
+# Optional override
+MMDR_REMOTE_HOST=my-builder scripts/remote-cargo.sh test
 ```
 
 The wrapper uses `rsync` + `ssh` and keeps host/IP details in your local environment
-or `~/.ssh/config`, not in this repository.
+or `~/.ssh/config`, not in this repository. By default it syncs into an isolated
+directory under remote `~/.cache` with `rsync --delete`, so it will not
+touch your normal remote working copy unless you set `MMDR_REMOTE_DIR` to that path.
 
 **Benchmarks:**
 ```bash
 cargo bench --bench renderer              # Microbenchmarks
 cargo build --release && python scripts/bench_compare.py  # vs mermaid-cli
 ```
+
+Release process: see `docs/release.md`.
 
 ## License
 

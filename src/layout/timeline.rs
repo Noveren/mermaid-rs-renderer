@@ -16,7 +16,7 @@ pub(super) fn compute_timeline_layout(
 
     let num_events = data.events.len().max(1);
     let total_events_width =
-        num_events as f32 * event_width + (num_events - 1).max(0) as f32 * event_spacing;
+        num_events as f32 * event_width + (num_events - 1) as f32 * event_spacing;
 
     let width = padding * 2.0 + total_events_width;
     let height = padding * 2.0 + title_height + event_height + 100.0;
@@ -70,9 +70,32 @@ pub(super) fn compute_timeline_layout(
         })
         .collect();
 
+    let mut nodes = BTreeMap::new();
+    nodes.insert(
+        "__timeline_metrics_content".to_string(),
+        NodeLayout {
+            id: "__timeline_metrics_content".to_string(),
+            x: padding,
+            y: padding,
+            width: (width - padding * 2.0).max(1.0),
+            height: (height - padding * 2.0).max(1.0),
+            label: TextBlock {
+                lines: vec![String::new()],
+                width: 0.0,
+                height: 0.0,
+            },
+            shape: crate::ir::NodeShape::Rectangle,
+            style: crate::ir::NodeStyle::default(),
+            link: None,
+            anchor_subgraph: None,
+            hidden: false,
+            icon: None,
+        },
+    );
+
     Layout {
         kind: graph.kind,
-        nodes: BTreeMap::new(),
+        nodes,
         edges: Vec::new(),
         subgraphs: Vec::new(),
         diagram: DiagramData::Timeline(TimelineLayout {

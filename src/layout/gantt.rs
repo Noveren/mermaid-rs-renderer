@@ -97,9 +97,7 @@ fn parse_gantt_date(value: &str) -> Option<i32> {
     if value.is_empty() {
         return None;
     }
-    let parts: Vec<&str> = value
-        .split(|ch| ch == '-' || ch == '/' || ch == '.')
-        .collect();
+    let parts: Vec<&str> = value.split(['-', '/', '.']).collect();
     if parts.len() != 3 {
         return None;
     }
@@ -210,12 +208,11 @@ pub(super) fn compute_gantt_layout(graph: &Graph, theme: &Theme, config: &Layout
             .unwrap_or(default_duration)
             .max(0.1);
         let mut start = parsed_starts.get(&task.id).copied();
-        if start.is_none() {
-            if let Some(after_id) = task.after.as_deref() {
-                if let Some((_, end)) = timing.get(after_id) {
-                    start = Some(*end);
-                }
-            }
+        if start.is_none()
+            && let Some(after_id) = task.after.as_deref()
+            && let Some((_, end)) = timing.get(after_id)
+        {
+            start = Some(*end);
         }
         let fallback_base = origin.unwrap_or(0.0);
         let start = start.unwrap_or(fallback_base + cursor);
@@ -354,15 +351,31 @@ pub(super) fn compute_gantt_layout(graph: &Graph, theme: &Theme, config: &Layout
         sections[prev_idx].height = height;
     }
 
+    let tick_font = theme.font_size * 0.8;
+    let max_tick_half_width = ticks
+        .iter()
+        .map(|tick| {
+            measure_label_with_font_size(
+                tick.label.as_str(),
+                tick_font,
+                config,
+                false,
+                theme.font_family.as_str(),
+            )
+            .width
+                / 2.0
+        })
+        .fold(0.0_f32, f32::max);
     let axis_pad = row_height * 0.9 + theme.font_size;
     let height = y + padding + axis_pad;
-
-    let tick_overflow = ticks
-        .last()
-        .map(|t| measure_label(&t.label, theme, config).width / 2.0)
-        .unwrap_or(0.0);
-    let label_overflow = if compact { task_label_width } else { 0.0 };
-    let right_padding = padding + tick_overflow.max(label_overflow);
+    let label_overflow = if compact {
+        padding + task_label_width
+    } else {
+        0.0
+    };
+    let right_padding = (max_tick_half_width + padding * 0.4)
+        .max(label_overflow)
+        .max(padding);
     let width = chart_x + chart_width + right_padding;
 
     Layout {
