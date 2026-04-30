@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 use crate::config::LayoutConfig;
@@ -139,8 +140,10 @@ pub(in crate::layout) fn build_routed_edges(ctx: RoutedEdgeBuildContext<'_>) -> 
     } else {
         None
     };
+    #[allow(unused)]
     let mut stage_metrics = stage_metrics;
 
+    #[cfg(not(target_arch = "wasm32"))]
     let port_assignment_start = Instant::now();
     let mut node_degrees: HashMap<String, usize> = HashMap::new();
     for edge in &graph.edges {
@@ -408,12 +411,14 @@ pub(in crate::layout) fn build_routed_edges(ctx: RoutedEdgeBuildContext<'_>) -> 
             }
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(metrics) = stage_metrics.as_mut() {
         metrics.port_assignment_us = metrics
             .port_assignment_us
             .saturating_add(port_assignment_start.elapsed().as_micros());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     let edge_routing_start = Instant::now();
     let lane_assignments = plan::plan_edge_lanes(graph, nodes, subgraphs, config);
     let lane_offsets = lane_assignments.effective_offsets(&edge_ports, graph.kind, config);
@@ -791,6 +796,7 @@ pub(in crate::layout) fn build_routed_edges(ctx: RoutedEdgeBuildContext<'_>) -> 
         );
         debug_assert!(plan_snapshot.is_consistent());
     }
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(metrics) = stage_metrics {
         metrics.edge_routing_us = metrics
             .edge_routing_us

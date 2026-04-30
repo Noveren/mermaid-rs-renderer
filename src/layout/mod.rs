@@ -211,10 +211,12 @@ pub fn compute_layout_with_metrics(
     if matches!(layout.diagram, DiagramData::Sequence(_)) {
         sequence::finalize_sequence_layout_bounds(&mut layout);
     }
-    stage_metrics.label_placement_us = stage_metrics
-        .label_placement_us
-        .saturating_add(label_start.elapsed().as_micros());
-
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        stage_metrics.label_placement_us = stage_metrics
+            .label_placement_us
+            .saturating_add(label_start.elapsed().as_micros());
+    }
     (layout, stage_metrics)
 }
 

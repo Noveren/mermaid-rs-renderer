@@ -306,20 +306,33 @@ pub fn render_with_detailed_timing(
     input: &str,
     options: RenderOptions,
 ) -> anyhow::Result<RenderDetailedResult> {
+    #[cfg(not(target_arch = "wasm32"))]
     use std::time::Instant;
 
+    #[cfg(not(target_arch = "wasm32"))]
     let t0 = Instant::now();
     let parsed = parse_mermaid(input)?;
+    #[cfg(not(target_arch = "wasm32"))]
     let parse_us = t0.elapsed().as_micros();
+    #[cfg(target_arch = "wasm32")]
+    let parse_us = 0;
 
+    #[cfg(not(target_arch = "wasm32"))]
     let t1 = Instant::now();
     let (layout, layout_stages) =
         compute_layout_with_metrics(&parsed.graph, &options.theme, &options.layout);
+    #[cfg(not(target_arch = "wasm32"))]
     let layout_us = t1.elapsed().as_micros();
+    #[cfg(target_arch = "wasm32")]
+    let layout_us = 0;
 
+    #[cfg(not(target_arch = "wasm32"))]
     let t2 = Instant::now();
     let svg = render_svg(&layout, &options.theme, &options.layout);
+    #[cfg(not(target_arch = "wasm32"))]
     let render_us = t2.elapsed().as_micros();
+    #[cfg(target_arch = "wasm32")]
+    let render_us = 0;
 
     Ok(RenderDetailedResult {
         svg,
