@@ -98,7 +98,7 @@ pub(super) fn initialize_route_label_plans(
             continue;
         }
 
-        let center = provisional_route_label_center(
+        let Some(center) = provisional_route_label_center(
             idx,
             label,
             &ProvisionalRouteLabelCenterContext {
@@ -112,7 +112,9 @@ pub(super) fn initialize_route_label_plans(
                 edge_label_pad_y,
                 config,
             },
-        );
+        ) else {
+            continue;
+        };
         let obstacle_id = format!("edge-label-reserved:{idx}");
         let obstacle_index = route_label_obstacles.len();
         route_label_obstacles.push(Obstacle {
@@ -138,11 +140,13 @@ fn provisional_route_label_center(
     idx: usize,
     label: &TextBlock,
     ctx: &ProvisionalRouteLabelCenterContext<'_>,
-) -> (f32, f32) {
+) -> Option<(f32, f32)> {
     let graph = ctx.graph;
     let edge = &graph.edges[idx];
-    let from_layout = ctx.nodes.get(&edge.from).expect("from node missing");
-    let to_layout = ctx.nodes.get(&edge.to).expect("to node missing");
+    let (Some(from_layout), Some(to_layout)) = (ctx.nodes.get(&edge.from), ctx.nodes.get(&edge.to))
+    else {
+        return None;
+    };
     let temp_from = from_layout.anchor_subgraph.and_then(|anchor_idx| {
         ctx.subgraphs
             .get(anchor_idx)
@@ -155,11 +159,12 @@ fn provisional_route_label_center(
     });
     let from = temp_from.as_ref().unwrap_or(from_layout);
     let to = temp_to.as_ref().unwrap_or(to_layout);
-    let port_info = ctx
-        .edge_ports
-        .get(idx)
-        .copied()
-        .expect("edge port info missing");
+    let port_info = ctx.edge_ports.get(idx).copied().unwrap_or(EdgePortInfo {
+        start_side: super::super::routing::EdgeSide::Right,
+        end_side: super::super::routing::EdgeSide::Left,
+        start_offset: 0.0,
+        end_offset: 0.0,
+    });
     let start = anchor_point_for_node(from, port_info.start_side, port_info.start_offset);
     let end = anchor_point_for_node(to, port_info.end_side, port_info.end_offset);
 
@@ -234,7 +239,7 @@ fn provisional_route_label_center(
             }
         }
     }
-    center
+    Some(center)
 }
 
 pub(super) fn sync_route_label_plan_with_points(
@@ -316,7 +321,7 @@ fn path_intersects_label_obstacle(points: &[(f32, f32)], obstacle: &Obstacle) ->
 fn detour_flowchart_path_around_label(
     points: &[(f32, f32)],
     obstacle: &Obstacle,
-    direction: Direction,
+    _direction: Direction,
     clearance: f32,
 ) -> Option<Vec<(f32, f32)>> {
     if points.len() < 2 || !path_intersects_label_obstacle(points, obstacle) {
@@ -336,41 +341,41 @@ fn detour_flowchart_path_around_label(
     let bottom = obstacle.y + obstacle.height + clearance;
     let mut candidates = Vec::new();
 
-    if is_horizontal(direction) {
-        let forward = exit.0 >= entry.0;
-        let (near_x, far_x) = if forward {
-            (left, right)
-        } else {
-            (right, left)
-        };
-        for y in [top, bottom] {
-            let mut candidate = Vec::with_capacity(points.len() + 2);
-            candidate.extend_from_slice(&points[..=first]);
-            candidate.push((near_x, y));
-            candidate.push((far_x, y));
-            candidate.extend_from_slice(&points[(last + 1)..]);
-            let candidate = compress_path(&candidate);
-            if !path_intersects_label_obstacle(&candidate, obstacle) {
-                candidates.push(candidate);
-            }
-        }
+    let via_left = (entry.0 - left).abs() + (exit.0 - left).abs();
+    let via_right = (entry.0 - right).abs() + (exit.0 - right).abs();
+    let xs = if via_left <= via_right {
+        [left, right]
     } else {
-        let forward = exit.1 >= entry.1;
-        let (near_y, far_y) = if forward {
-            (top, bottom)
-        } else {
-            (bottom, top)
-        };
-        for x in [left, right] {
-            let mut candidate = Vec::with_capacity(points.len() + 2);
-            candidate.extend_from_slice(&points[..=first]);
-            candidate.push((x, near_y));
-            candidate.push((x, far_y));
-            candidate.extend_from_slice(&points[(last + 1)..]);
-            let candidate = compress_path(&candidate);
-            if !path_intersects_label_obstacle(&candidate, obstacle) {
-                candidates.push(candidate);
-            }
+        [right, left]
+    };
+    for x in xs {
+        let mut candidate = Vec::with_capacity(points.len() + 2);
+        candidate.extend_from_slice(&points[..=first]);
+        candidate.push((x, entry.1));
+        candidate.push((x, exit.1));
+        candidate.extend_from_slice(&points[(last + 1)..]);
+        let candidate = compress_path(&candidate);
+        if !path_intersects_label_obstacle(&candidate, obstacle) {
+            candidates.push(candidate);
+        }
+    }
+
+    let via_top = (entry.1 - top).abs() + (exit.1 - top).abs();
+    let via_bottom = (entry.1 - bottom).abs() + (exit.1 - bottom).abs();
+    let ys = if via_top <= via_bottom {
+        [top, bottom]
+    } else {
+        [bottom, top]
+    };
+    for y in ys {
+        let mut candidate = Vec::with_capacity(points.len() + 2);
+        candidate.extend_from_slice(&points[..=first]);
+        candidate.push((entry.0, y));
+        candidate.push((exit.0, y));
+        candidate.extend_from_slice(&points[(last + 1)..]);
+        let candidate = compress_path(&candidate);
+        if !path_intersects_label_obstacle(&candidate, obstacle) {
+            candidates.push(candidate);
         }
     }
 

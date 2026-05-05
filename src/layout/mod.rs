@@ -5,6 +5,7 @@ mod error;
 mod flowchart;
 mod gantt;
 mod gitgraph;
+mod invariants;
 mod journey;
 mod kanban;
 pub(crate) mod label_placement;
@@ -28,6 +29,7 @@ use c4::*;
 use error::*;
 use gantt::*;
 use gitgraph::*;
+pub use invariants::{LayoutInvariantError, validate_layout_invariants};
 use journey::*;
 use kanban::*;
 use mindmap::*;
@@ -48,6 +50,7 @@ use crate::config::{LayoutConfig, PieRenderMode, TreemapRenderMode};
 use crate::ir::{Direction, Graph};
 use crate::text_metrics;
 use crate::theme::{Theme, adjust_color, parse_color_to_hsl};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
@@ -157,6 +160,8 @@ pub fn compute_layout_with_metrics(
     theme: &Theme,
     config: &LayoutConfig,
 ) -> (Layout, LayoutStageMetrics) {
+    let graph = normalize_graph_for_layout(graph);
+    let graph = graph.as_ref();
     let mut stage_metrics = LayoutStageMetrics::default();
     let mut layout = match graph.kind {
         crate::ir::DiagramKind::Sequence | crate::ir::DiagramKind::ZenUML => {
@@ -210,6 +215,8 @@ pub fn compute_layout_with_metrics(
     label_placement::resolve_all_label_positions(&mut layout, theme, config);
     if matches!(layout.diagram, DiagramData::Sequence(_)) {
         sequence::finalize_sequence_layout_bounds(&mut layout);
+    } else if matches!(layout.diagram, DiagramData::Graph { .. }) {
+        finalize_graph_label_bounds(&mut layout, config);
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -218,6 +225,198 @@ pub fn compute_layout_with_metrics(
             .saturating_add(label_start.elapsed().as_micros());
     }
     (layout, stage_metrics)
+}
+
+fn normalize_graph_for_layout(graph: &Graph) -> Cow<'_, Graph> {
+    let needs_edge_nodes = graph
+        .edges
+        .iter()
+        .any(|edge| !graph.nodes.contains_key(&edge.from) || !graph.nodes.contains_key(&edge.to));
+    let needs_sequence_nodes = matches!(
+        graph.kind,
+        crate::ir::DiagramKind::Sequence | crate::ir::DiagramKind::ZenUML
+    ) && graph
+        .sequence_participants
+        .iter()
+        .any(|id| !graph.nodes.contains_key(id));
+
+    if !needs_edge_nodes && !needs_sequence_nodes {
+        return Cow::Borrowed(graph);
+    }
+
+    let mut normalized = graph.clone();
+    for edge in &graph.edges {
+        normalized.ensure_node(&edge.from, None, None);
+        normalized.ensure_node(&edge.to, None, None);
+    }
+    if matches!(
+        graph.kind,
+        crate::ir::DiagramKind::Sequence | crate::ir::DiagramKind::ZenUML
+    ) {
+        for id in &graph.sequence_participants {
+            normalized.ensure_node(id, None, None);
+        }
+    }
+    Cow::Owned(normalized)
+}
+
+fn include_rect_bounds(
+    min_x: &mut f32,
+    min_y: &mut f32,
+    max_x: &mut f32,
+    max_y: &mut f32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) {
+    *min_x = (*min_x).min(x);
+    *min_y = (*min_y).min(y);
+    *max_x = (*max_x).max(x + width);
+    *max_y = (*max_y).max(y + height);
+}
+
+fn translate_graph_layout(layout: &mut Layout, dx: f32, dy: f32) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    for node in layout.nodes.values_mut() {
+        node.x += dx;
+        node.y += dy;
+    }
+    for subgraph in &mut layout.subgraphs {
+        subgraph.x += dx;
+        subgraph.y += dy;
+    }
+    for edge in &mut layout.edges {
+        for point in &mut edge.points {
+            point.0 += dx;
+            point.1 += dy;
+        }
+        if let Some(anchor) = &mut edge.label_anchor {
+            anchor.0 += dx;
+            anchor.1 += dy;
+        }
+        if let Some(anchor) = &mut edge.start_label_anchor {
+            anchor.0 += dx;
+            anchor.1 += dy;
+        }
+        if let Some(anchor) = &mut edge.end_label_anchor {
+            anchor.0 += dx;
+            anchor.1 += dy;
+        }
+    }
+    if let DiagramData::Graph { state_notes } = &mut layout.diagram {
+        for note in state_notes {
+            note.x += dx;
+            note.y += dy;
+        }
+    }
+}
+
+fn finalize_graph_label_bounds(layout: &mut Layout, config: &LayoutConfig) {
+    let mut min_x = 0.0f32;
+    let mut min_y = 0.0f32;
+    let mut max_x = layout.width;
+    let mut max_y = layout.height;
+    let (label_pad_x, label_pad_y) = label_placement::edge_label_padding(layout.kind, config);
+
+    for node in layout.nodes.values() {
+        include_rect_bounds(
+            &mut min_x,
+            &mut min_y,
+            &mut max_x,
+            &mut max_y,
+            node.x,
+            node.y,
+            node.width,
+            node.height,
+        );
+    }
+    for subgraph in &layout.subgraphs {
+        include_rect_bounds(
+            &mut min_x,
+            &mut min_y,
+            &mut max_x,
+            &mut max_y,
+            subgraph.x,
+            subgraph.y,
+            subgraph.width,
+            subgraph.height,
+        );
+    }
+    for edge in &layout.edges {
+        for point in &edge.points {
+            min_x = min_x.min(point.0);
+            min_y = min_y.min(point.1);
+            max_x = max_x.max(point.0);
+            max_y = max_y.max(point.1);
+        }
+        if let (Some(label), Some((x, y))) = (&edge.label, edge.label_anchor) {
+            include_rect_bounds(
+                &mut min_x,
+                &mut min_y,
+                &mut max_x,
+                &mut max_y,
+                x - label.width / 2.0 - label_pad_x,
+                y - label.height / 2.0 - label_pad_y,
+                label.width + label_pad_x * 2.0,
+                label.height + label_pad_y * 2.0,
+            );
+        }
+        if let (Some(label), Some((x, y))) = (&edge.start_label, edge.start_label_anchor) {
+            include_rect_bounds(
+                &mut min_x,
+                &mut min_y,
+                &mut max_x,
+                &mut max_y,
+                x - label.width / 2.0 - label_pad_x,
+                y - label.height / 2.0 - label_pad_y,
+                label.width + label_pad_x * 2.0,
+                label.height + label_pad_y * 2.0,
+            );
+        }
+        if let (Some(label), Some((x, y))) = (&edge.end_label, edge.end_label_anchor) {
+            include_rect_bounds(
+                &mut min_x,
+                &mut min_y,
+                &mut max_x,
+                &mut max_y,
+                x - label.width / 2.0 - label_pad_x,
+                y - label.height / 2.0 - label_pad_y,
+                label.width + label_pad_x * 2.0,
+                label.height + label_pad_y * 2.0,
+            );
+        }
+    }
+    if let DiagramData::Graph { state_notes } = &layout.diagram {
+        for note in state_notes {
+            include_rect_bounds(
+                &mut min_x,
+                &mut min_y,
+                &mut max_x,
+                &mut max_y,
+                note.x,
+                note.y,
+                note.width,
+                note.height,
+            );
+        }
+    }
+
+    let dx = if min_x < 0.0 {
+        -min_x + LAYOUT_BOUNDARY_PAD
+    } else {
+        0.0
+    };
+    let dy = if min_y < 0.0 {
+        -min_y + LAYOUT_BOUNDARY_PAD
+    } else {
+        0.0
+    };
+    translate_graph_layout(layout, dx, dy);
+    layout.width = (max_x + dx + LAYOUT_BOUNDARY_PAD).max(layout.width + dx);
+    layout.height = (max_y + dy + LAYOUT_BOUNDARY_PAD).max(layout.height + dy);
 }
 
 fn compute_flowchart_layout(
@@ -454,6 +653,12 @@ fn compute_flowchart_layout(
         &effective_config,
     );
     apply_subgraph_direction_overrides(graph, &mut nodes, config, &anchored_indices);
+    // Objective and direction passes can shift whole top-level groups after the
+    // initial subgraph cleanup. Re-apply the non-overlap spacing constraints
+    // before subgraph boxes are materialized so dense cross-subgraph flowcharts
+    // keep sibling regions visually distinct.
+    flowchart::subgraph_spacing::enforce_top_level_subgraph_gap(graph, &mut nodes, theme, config);
+    flowchart::subgraph_spacing::separate_sibling_subgraphs(graph, &mut nodes, theme, config);
     flowchart::subgraph_spacing::debug_assert_flowchart_node_layout_invariants(graph, &nodes);
 
     // For state diagrams, push non-member nodes outside subgraph bounds
@@ -494,6 +699,10 @@ pub(in crate::layout) fn resolve_edge_style(
     style
 }
 
+fn sanitize_stroke_width(width: f32) -> Option<f32> {
+    width.is_finite().then_some(width.max(0.0))
+}
+
 fn merge_edge_style(
     target: &mut crate::ir::EdgeStyleOverride,
     source: &crate::ir::EdgeStyleOverride,
@@ -501,8 +710,8 @@ fn merge_edge_style(
     if source.stroke.is_some() {
         target.stroke = source.stroke.clone();
     }
-    if source.stroke_width.is_some() {
-        target.stroke_width = source.stroke_width;
+    if let Some(width) = source.stroke_width.and_then(sanitize_stroke_width) {
+        target.stroke_width = Some(width);
     }
     if source.dasharray.is_some() {
         target.dasharray = source.dasharray.clone();
@@ -959,8 +1168,8 @@ fn merge_node_style(target: &mut crate::ir::NodeStyle, source: &crate::ir::NodeS
     if source.text_color.is_some() {
         target.text_color = source.text_color.clone();
     }
-    if source.stroke_width.is_some() {
-        target.stroke_width = source.stroke_width;
+    if let Some(width) = source.stroke_width.and_then(sanitize_stroke_width) {
+        target.stroke_width = Some(width);
     }
     if source.stroke_dasharray.is_some() {
         target.stroke_dasharray = source.stroke_dasharray.clone();
@@ -1140,6 +1349,47 @@ mod tests {
         let a = layout.nodes.get("A").unwrap();
         let b = layout.nodes.get("B").unwrap();
         assert!(b.x >= a.x);
+    }
+
+    #[test]
+    fn layout_normalizes_missing_edge_endpoint_nodes() {
+        let mut graph = Graph::new();
+        graph.direction = Direction::LeftRight;
+        graph.ensure_node("A", Some("Alpha".to_string()), Some(NodeShape::Rectangle));
+        graph.edges.push(crate::ir::Edge {
+            from: "A".to_string(),
+            to: "B".to_string(),
+            label: None,
+            start_label: None,
+            end_label: None,
+            directed: true,
+            arrow_start: false,
+            arrow_end: true,
+            arrow_start_kind: None,
+            arrow_end_kind: None,
+            start_decoration: None,
+            end_decoration: None,
+            style: crate::ir::EdgeStyle::Solid,
+        });
+
+        let layout = compute_layout(&graph, &Theme::modern(), &LayoutConfig::default());
+
+        assert!(layout.nodes.contains_key("A"));
+        assert!(layout.nodes.contains_key("B"));
+        assert_eq!(layout.edges.len(), 1);
+    }
+
+    #[test]
+    fn sequence_layout_normalizes_missing_participants() {
+        let mut graph = Graph::new();
+        graph.kind = crate::ir::DiagramKind::Sequence;
+        graph.sequence_participants.push("Alice".to_string());
+        graph.sequence_participants.push("Bob".to_string());
+
+        let layout = compute_layout(&graph, &Theme::modern(), &LayoutConfig::default());
+
+        assert!(layout.nodes.contains_key("Alice"));
+        assert!(layout.nodes.contains_key("Bob"));
     }
 
     #[test]

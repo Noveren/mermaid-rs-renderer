@@ -4,7 +4,7 @@ use crate::layout_dump::write_layout_dump;
 use crate::parser::parse_mermaid;
 #[cfg(feature = "png")]
 use crate::render::write_output_png;
-use crate::render::{render_svg, write_output_svg};
+use crate::render::{render_svg_with_dimensions, write_output_svg};
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use std::io::{self, Read};
@@ -190,7 +190,12 @@ pub fn run() -> Result<()> {
         }
 
         let t_render_start = std::time::Instant::now();
-        let svg = render_svg(&layout, &config.theme, &config.layout);
+        let svg = render_svg_with_dimensions(
+            &layout,
+            &config.theme,
+            &config.layout,
+            Some((config.render.width, config.render.height)),
+        );
         let render_us = t_render_start.elapsed().as_micros();
 
         match args.output_format {
@@ -245,7 +250,12 @@ pub fn run() -> Result<()> {
         {
             write_layout_dump(path, &layout, &parsed.graph)?;
         }
-        let svg = render_svg(&layout, &config.theme, &config.layout);
+        let svg = render_svg_with_dimensions(
+            &layout,
+            &config.theme,
+            &config.layout,
+            Some((config.render.width, config.render.height)),
+        );
         match args.output_format {
             OutputFormat::Svg => {
                 write_output_svg(&svg, Some(&outputs[idx]))?;
@@ -1504,6 +1514,11 @@ fn merge_init_config(mut config: Config, init: serde_json::Value) -> Config {
         if let Some(val) = get_string(c4, "externalComponentQueueBorderColor") {
             config.layout.c4.external_component_queue_border_color = val;
         }
+    }
+    if let Some(mindmap) = init.get("mindmap").and_then(|v| v.as_object())
+        && let Some(val) = mindmap.get("layoutAlgorithm").and_then(|v| v.as_str())
+    {
+        config.layout.mindmap.layout_algorithm = val.to_string();
     }
     config.render.background = config.theme.background.clone();
     config

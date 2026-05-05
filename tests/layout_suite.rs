@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use mermaid_rs_renderer::layout::DiagramData;
+use mermaid_rs_renderer::layout::{DiagramData, validate_layout_invariants};
 use mermaid_rs_renderer::{Layout, LayoutConfig, Theme, compute_layout, parse_mermaid, render_svg};
 
 fn assert_valid_svg(svg: &str, fixture: &str) {
@@ -287,6 +287,9 @@ fn assert_sequence_label_clear_of_lifelines(layout: &Layout, fixture: &str) {
             label.height + 4.0,
         );
         for lifeline in &seq.lifelines {
+            if lifeline.id == edge.from || lifeline.id == edge.to {
+                continue;
+            }
             let line_rect = (
                 lifeline.x - 1.5,
                 lifeline.y1,
@@ -365,6 +368,8 @@ fn render_all_fixtures() {
         "journey/basic.mmd",
         "kanban/basic.mmd",
         "mindmap/basic.mmd",
+        "mindmap/tidy_tree.mmd",
+        "mindmap/lr_tree.mmd",
         "packet/basic.mmd",
         "pie/basic.mmd",
         "quadrant/basic.mmd",
@@ -390,10 +395,278 @@ fn render_all_fixtures() {
         assert!(path.exists(), "fixture missing: {}", rel);
         let (layout, svg) = render_fixture(&path);
         assert_layout_is_well_formed(&layout, &rel);
+        if let Err(errors) = validate_layout_invariants(&layout) {
+            panic!(
+                "{rel}: layout invariant violations:\n{}",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
         assert_flowchart_visual_invariants(&layout, &rel);
         assert_sequence_label_clear_of_lifelines(&layout, &rel);
         assert_valid_svg(&svg, &rel);
     }
+}
+
+#[test]
+fn pie_outside_labels_do_not_intrude_into_right_legend() {
+    let input = r#"pie
+"Dogs" : 386
+"Cats" : 85.9
+"Rats" : 15
+"#;
+    let parsed = parse_mermaid(input).unwrap();
+    let theme = Theme::modern();
+    let config = LayoutConfig::default();
+    let layout = compute_layout(&parsed.graph, &theme, &config);
+    let DiagramData::Pie(pie) = &layout.diagram else {
+        panic!("expected pie layout");
+    };
+
+    let legend_left = pie
+        .legend
+        .iter()
+        .map(|item| item.x)
+        .fold(f32::INFINITY, f32::min);
+    let right_outside_label_right = pie
+        .slices
+        .iter()
+        .filter_map(|slice| {
+            let span = (slice.end_angle - slice.start_angle).abs();
+            let mid_angle = (slice.start_angle + slice.end_angle) / 2.0;
+            if span < 0.4 && mid_angle.cos() >= 0.0 {
+                Some(pie.center.0 + pie.radius + slice.label.width)
+            } else {
+                None
+            }
+        })
+        .fold(0.0, f32::max);
+
+    assert!(
+        legend_left > right_outside_label_right,
+        "right-side outside pie labels should have reserved space before the legend: legend_left={legend_left}, label_right={right_outside_label_right}"
+    );
+}
+
+#[test]
+fn bidirectional_flowchart_labels_do_not_overlap() {
+    let input = r#"flowchart TD
+    dep1 -->|subs| link1
+    link1 -->|sub| sub1
+    sub1 -->|deps| link1
+    link1 -->|dep| dep1
+
+    link1 -->|nextSub| link2
+    link2 -->|prevSub| link1
+
+    link2 -->|sub| sub2
+    sub2 -->|deps| link2
+"#;
+    let parsed = parse_mermaid(input).unwrap();
+    let theme = Theme::modern();
+    let config = LayoutConfig::default();
+    let layout = compute_layout(&parsed.graph, &theme, &config);
+    assert_layout_is_well_formed(&layout, "flowchart/issue63-inline.mmd");
+
+    let labels: Vec<_> = layout
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let label = edge.label.as_ref()?;
+            let anchor = edge.label_anchor?;
+            Some((
+                edge.from.as_str(),
+                edge.to.as_str(),
+                (
+                    anchor.0 - label.width / 2.0,
+                    anchor.1 - label.height / 2.0,
+                    label.width,
+                    label.height,
+                ),
+            ))
+        })
+        .collect();
+    assert_eq!(labels.len(), 8, "all edge labels should be placed");
+    for (idx, (from, to, rect)) in labels.iter().enumerate() {
+        for (other_from, other_to, other_rect) in labels.iter().skip(idx + 1) {
+            let overlap = rect_overlap_area(*rect, *other_rect);
+            assert!(
+                overlap <= 1.0,
+                "edge labels {from}->{to} and {other_from}->{other_to} overlap by {overlap:.2}px²"
+            );
+        }
+    }
+}
+
+#[test]
+fn parallel_long_flowchart_labels_expand_bounds_and_do_not_overlap() {
+    let input = r#"flowchart LR
+  A[Short] -->|this is a very long parallel edge label number one| B[Other]
+  A -->|this is a very long parallel edge label number two| B
+  A -->|this is a very long parallel edge label number three| B
+"#;
+    let parsed = parse_mermaid(input).unwrap();
+    let theme = Theme::modern();
+    let config = LayoutConfig::default();
+    let layout = compute_layout(&parsed.graph, &theme, &config);
+
+    let labels: Vec<_> = layout
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let label = edge.label.as_ref()?;
+            let anchor = edge.label_anchor?;
+            Some((
+                anchor.0 - label.width / 2.0,
+                anchor.1 - label.height / 2.0,
+                label.width,
+                label.height,
+            ))
+        })
+        .collect();
+    assert_eq!(labels.len(), 3, "all parallel labels should be placed");
+    for rect in &labels {
+        assert!(rect.0 >= -0.1, "label extends left of layout: {rect:?}");
+        assert!(rect.1 >= -0.1, "label extends above layout: {rect:?}");
+        assert!(
+            rect.0 + rect.2 <= layout.width + 0.1,
+            "label exceeds layout width: {rect:?} width={}",
+            layout.width
+        );
+        assert!(
+            rect.1 + rect.3 <= layout.height + 0.1,
+            "label exceeds layout height: {rect:?} height={}",
+            layout.height
+        );
+    }
+    for (idx, rect) in labels.iter().enumerate() {
+        for other in labels.iter().skip(idx + 1) {
+            let overlap = rect_overlap_area(*rect, *other);
+            assert!(overlap <= 1.0, "parallel labels overlap by {overlap:.2}px²");
+        }
+    }
+}
+
+#[test]
+fn long_edge_label_flowchart_keeps_top_level_subgraphs_separate() {
+    let input = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("benches")
+            .join("fixtures")
+            .join("flowchart_long_edge_labels.mmd"),
+    )
+    .unwrap();
+    let parsed = parse_mermaid(&input).unwrap();
+    let theme = Theme::modern();
+    let config = LayoutConfig::default();
+    let layout = compute_layout(&parsed.graph, &theme, &config);
+
+    assert_flowchart_visual_invariants(&layout, "flowchart/long_edge_labels.mmd");
+}
+
+#[test]
+fn flowchart_label_collision_fixture_routes_around_non_endpoint_nodes() {
+    let input = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("benches")
+            .join("fixtures")
+            .join("flowchart_label_collision.mmd"),
+    )
+    .unwrap();
+    let parsed = parse_mermaid(&input).unwrap();
+    let theme = Theme::modern();
+    let config = LayoutConfig::default();
+    let layout = compute_layout(&parsed.graph, &theme, &config);
+
+    for edge in &layout.edges {
+        for segment in edge.points.windows(2) {
+            for node in layout.nodes.values() {
+                if node.id == edge.from || node.id == edge.to || node.hidden {
+                    continue;
+                }
+                let rect = (node.x, node.y, node.width, node.height);
+                assert!(
+                    !segment_intersects_rect(segment[0], segment[1], rect),
+                    "edge {}->{} crosses non-endpoint node {}",
+                    edge.from,
+                    edge.to,
+                    node.id
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn td_loopback_uses_outer_left_ports_and_orthogonal_lane() {
+    let input = r#"flowchart TD
+  Start([Start]) --> Input[/Read Input/]
+  Input --> Check{Valid?}
+  Check -->|Yes| Process[Process Data]
+  Check -->|No| Error[Show Error]
+  Error --> Input
+  Process --> Save[(Save to DB)]
+  Save --> Done([End])
+"#;
+    let parsed = parse_mermaid(input).unwrap();
+    let theme = Theme::modern();
+    let config = LayoutConfig::default();
+    let layout = compute_layout(&parsed.graph, &theme, &config);
+    assert_layout_is_well_formed(&layout, "flowchart/td-loopback-ports.mmd");
+
+    let error = layout.nodes.get("Error").expect("Error node");
+    let input_node = layout.nodes.get("Input").expect("Input node");
+    let edge = layout
+        .edges
+        .iter()
+        .find(|edge| edge.from == "Error" && edge.to == "Input")
+        .expect("Error->Input loopback edge");
+
+    assert!(
+        edge.points.len() >= 4,
+        "loopback should use an outer lane with bends, got {:?}",
+        edge.points
+    );
+    assert!(
+        edge.points.windows(2).all(|segment| {
+            (segment[1].0 - segment[0].0).abs() <= 1e-3
+                || (segment[1].1 - segment[0].1).abs() <= 1e-3
+        }),
+        "loopback should stay orthogonal, got {:?}",
+        edge.points
+    );
+
+    let first = edge.points[0];
+    let second = edge.points[1];
+    let penultimate = edge.points[edge.points.len() - 2];
+    let last = edge.points[edge.points.len() - 1];
+
+    assert!(
+        (first.0 - error.x).abs() <= 1.0,
+        "loopback should leave Error from the diagram's outer-left side, got {:?} for Error {:?}",
+        edge.points,
+        error
+    );
+    assert!(
+        second.0 < first.0 - 1.0 && (second.1 - first.1).abs() <= 1.0,
+        "loopback should move outward immediately instead of crossing the source node, got {:?}",
+        edge.points
+    );
+    assert!(
+        second.0 < error.x && penultimate.0 < input_node.x,
+        "loopback lane should run outside the left edge of the involved nodes, got {:?}",
+        edge.points
+    );
+    assert!(
+        last.0 < input_node.x + input_node.width * 0.35
+            && penultimate.0 < last.0
+            && (penultimate.1 - last.1).abs() <= 1.0,
+        "loopback should re-enter Input from its left-side port, got {:?}",
+        edge.points
+    );
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use crate::ir::{DiagramKind, Direction, Graph, NodeStyle, Subgraph};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, VecDeque};
@@ -56,7 +56,11 @@ pub struct ParseOutput {
 }
 
 pub fn parse_mermaid(input: &str) -> Result<ParseOutput> {
-    match detect_diagram_kind(input) {
+    validate_init_directives(input)?;
+    let Some(kind) = detect_diagram_kind(input) else {
+        bail!("unknown or missing Mermaid diagram header");
+    };
+    match kind {
         DiagramKind::Class => parse_class_diagram(input),
         DiagramKind::State => parse_state_diagram(input),
         DiagramKind::Sequence => parse_sequence_diagram(input),
@@ -83,7 +87,26 @@ pub fn parse_mermaid(input: &str) -> Result<ParseOutput> {
     }
 }
 
-fn detect_diagram_kind(input: &str) -> DiagramKind {
+fn validate_init_directives(input: &str) -> Result<()> {
+    let mut in_frontmatter = false;
+    for raw_line in input.lines() {
+        let trimmed_line = raw_line.trim();
+        if trimmed_line.is_empty() {
+            continue;
+        }
+        if trimmed_line == "---" {
+            in_frontmatter = !in_frontmatter;
+            continue;
+        }
+        if in_frontmatter {
+            continue;
+        }
+        let _ = parse_init_directive(trimmed_line)?;
+    }
+    Ok(())
+}
+
+fn detect_diagram_kind(input: &str) -> Option<DiagramKind> {
     let mut in_frontmatter = false;
     for raw_line in input.lines() {
         let trimmed_line = raw_line.trim();
@@ -108,77 +131,138 @@ fn detect_diagram_kind(input: &str) -> DiagramKind {
             continue;
         }
         let lower = without_comment.to_ascii_lowercase();
-        if lower.starts_with("sequencediagram") {
-            return DiagramKind::Sequence;
+        if starts_with_diagram_header(&lower, "sequencediagram") {
+            return Some(DiagramKind::Sequence);
         }
-        if lower.starts_with("classdiagram") {
-            return DiagramKind::Class;
+        if starts_with_diagram_header(&lower, "classdiagram") {
+            return Some(DiagramKind::Class);
         }
-        if lower.starts_with("statediagram") {
-            return DiagramKind::State;
+        if starts_with_diagram_header(&lower, "statediagram") {
+            return Some(DiagramKind::State);
         }
-        if lower.starts_with("erdiagram") {
-            return DiagramKind::Er;
+        if starts_with_diagram_header(&lower, "erdiagram") {
+            return Some(DiagramKind::Er);
         }
-        if lower.starts_with("pie") {
-            return DiagramKind::Pie;
+        if starts_with_diagram_header(&lower, "pie") {
+            return Some(DiagramKind::Pie);
         }
-        if lower.starts_with("mindmap") {
-            return DiagramKind::Mindmap;
+        if starts_with_diagram_header(&lower, "mindmap") {
+            return Some(DiagramKind::Mindmap);
         }
-        if lower.starts_with("journey") {
-            return DiagramKind::Journey;
+        if starts_with_diagram_header(&lower, "journey") {
+            return Some(DiagramKind::Journey);
         }
-        if lower.starts_with("timeline") {
-            return DiagramKind::Timeline;
+        if starts_with_diagram_header(&lower, "timeline") {
+            return Some(DiagramKind::Timeline);
         }
-        if lower.starts_with("gantt") {
-            return DiagramKind::Gantt;
+        if starts_with_diagram_header(&lower, "gantt") {
+            return Some(DiagramKind::Gantt);
         }
-        if lower.starts_with("requirementdiagram") {
-            return DiagramKind::Requirement;
+        if starts_with_diagram_header(&lower, "requirementdiagram") {
+            return Some(DiagramKind::Requirement);
         }
-        if lower.starts_with("gitgraph") {
-            return DiagramKind::GitGraph;
+        if starts_with_diagram_header(&lower, "gitgraph") {
+            return Some(DiagramKind::GitGraph);
         }
-        if lower.starts_with("c4") {
-            return DiagramKind::C4;
+        if starts_with_c4_header(&lower) {
+            return Some(DiagramKind::C4);
         }
-        if lower.starts_with("sankey") {
-            return DiagramKind::Sankey;
+        if starts_with_diagram_header(&lower, "sankey") {
+            return Some(DiagramKind::Sankey);
         }
-        if lower.starts_with("quadrantchart") {
-            return DiagramKind::Quadrant;
+        if starts_with_diagram_header(&lower, "quadrantchart") {
+            return Some(DiagramKind::Quadrant);
         }
-        if lower.starts_with("zenuml") {
-            return DiagramKind::ZenUML;
+        if starts_with_diagram_header(&lower, "zenuml") {
+            return Some(DiagramKind::ZenUML);
         }
-        if lower.starts_with("block") {
-            return DiagramKind::Block;
+        if starts_with_diagram_header(&lower, "block") {
+            return Some(DiagramKind::Block);
         }
-        if lower.starts_with("packet") {
-            return DiagramKind::Packet;
+        if starts_with_diagram_header(&lower, "packet") {
+            return Some(DiagramKind::Packet);
         }
-        if lower.starts_with("kanban") {
-            return DiagramKind::Kanban;
+        if starts_with_diagram_header(&lower, "kanban") {
+            return Some(DiagramKind::Kanban);
         }
-        if lower.starts_with("architecture") {
-            return DiagramKind::Architecture;
+        if starts_with_diagram_header(&lower, "architecture") {
+            return Some(DiagramKind::Architecture);
         }
-        if lower.starts_with("radar") {
-            return DiagramKind::Radar;
+        if starts_with_diagram_header(&lower, "radar") {
+            return Some(DiagramKind::Radar);
         }
-        if lower.starts_with("treemap") {
-            return DiagramKind::Treemap;
+        if starts_with_diagram_header(&lower, "treemap") {
+            return Some(DiagramKind::Treemap);
         }
-        if lower.starts_with("xychart") {
-            return DiagramKind::XYChart;
+        if starts_with_diagram_header(&lower, "xychart") {
+            return Some(DiagramKind::XYChart);
         }
-        if lower.starts_with("flowchart") || lower.starts_with("graph") {
-            return DiagramKind::Flowchart;
+        if starts_with_diagram_header(&lower, "flowchart")
+            || starts_with_diagram_header(&lower, "graph")
+        {
+            return Some(DiagramKind::Flowchart);
         }
+        if looks_like_flowchart_edge_syntax(&without_comment) {
+            return Some(DiagramKind::Flowchart);
+        }
+        return None;
     }
-    DiagramKind::Flowchart
+    None
+}
+
+fn starts_with_diagram_header(line: &str, keyword: &str) -> bool {
+    let Some(rest) = line.strip_prefix(keyword) else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric())
+}
+
+fn starts_with_c4_header(line: &str) -> bool {
+    [
+        "c4",
+        "c4context",
+        "c4container",
+        "c4component",
+        "c4dynamic",
+        "c4deployment",
+    ]
+    .iter()
+    .any(|keyword| starts_with_diagram_header(line, keyword))
+}
+
+fn parse_init_directive(trimmed_line: &str) -> Result<Option<serde_json::Value>> {
+    if let Some(caps) = INIT_RE.captures(trimmed_line) {
+        if let Some(json_str) = caps.get(1).map(|m| m.as_str()) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                return Ok(Some(value));
+            }
+            if let Ok(value) = json5::from_str::<serde_json::Value>(json_str) {
+                return Ok(Some(value));
+            }
+            bail!("invalid Mermaid init directive: could not parse JSON/JSON5 config");
+        }
+        bail!("invalid Mermaid init directive: missing config object");
+    }
+
+    if trimmed_line.starts_with("%%{") && trimmed_line.to_ascii_lowercase().contains("init") {
+        bail!("invalid Mermaid init directive syntax");
+    }
+
+    Ok(None)
+}
+
+fn looks_like_flowchart_edge_syntax(line: &str) -> bool {
+    ARROW_TOKEN_RE.is_match(&mask_bracket_content(line))
+}
+
+fn has_missing_flowchart_edge_endpoint(line: &str) -> bool {
+    let masked = mask_bracket_content(line);
+    let trimmed = masked.trim();
+    ARROW_TOKEN_RE
+        .find_iter(trimmed)
+        .any(|m| trimmed[..m.start()].trim().is_empty() || trimmed[m.end()..].trim().is_empty())
 }
 
 fn preprocess_input(input: &str) -> Result<(Vec<String>, Option<serde_json::Value>)> {
@@ -198,14 +282,8 @@ fn preprocess_input(input: &str) -> Result<(Vec<String>, Option<serde_json::Valu
         if in_frontmatter {
             continue;
         }
-        if let Some(caps) = INIT_RE.captures(trimmed_line) {
-            if let Some(json_str) = caps.get(1).map(|m| m.as_str()) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    init_config = Some(value);
-                } else if let Ok(value) = json5::from_str::<serde_json::Value>(json_str) {
-                    init_config = Some(value);
-                }
-            }
+        if let Some(value) = parse_init_directive(trimmed_line)? {
+            init_config = Some(value);
             continue;
         }
         if trimmed_line.starts_with("%%") {
@@ -224,20 +302,22 @@ fn preprocess_input(input: &str) -> Result<(Vec<String>, Option<serde_json::Valu
 fn preprocess_input_keep_indent(input: &str) -> Result<(Vec<String>, Option<serde_json::Value>)> {
     let mut init_config: Option<serde_json::Value> = None;
     let mut lines = Vec::new();
+    let mut in_frontmatter = false;
 
     for raw_line in input.lines() {
         let trimmed_line = raw_line.trim();
         if trimmed_line.is_empty() {
             continue;
         }
-        if let Some(caps) = INIT_RE.captures(trimmed_line) {
-            if let Some(json_str) = caps.get(1).map(|m| m.as_str()) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    init_config = Some(value);
-                } else if let Ok(value) = json5::from_str::<serde_json::Value>(json_str) {
-                    init_config = Some(value);
-                }
-            }
+        if trimmed_line == "---" {
+            in_frontmatter = !in_frontmatter;
+            continue;
+        }
+        if in_frontmatter {
+            continue;
+        }
+        if let Some(value) = parse_init_directive(trimmed_line)? {
+            init_config = Some(value);
             continue;
         }
         if trimmed_line.starts_with("%%") {
@@ -338,10 +418,18 @@ fn parse_flowchart(input: &str) -> Result<ParseOutput> {
                 continue;
             }
 
+            if has_missing_flowchart_edge_endpoint(&line) {
+                bail!("invalid flowchart edge syntax: {line}");
+            }
+
             if let Some(chain_lines) = split_edge_chain(&line) {
                 let mut added = false;
                 for edge_line in chain_lines {
-                    added |= add_flowchart_edge(&edge_line, &mut graph, &subgraph_stack);
+                    if add_flowchart_edge(&edge_line, &mut graph, &subgraph_stack) {
+                        added = true;
+                    } else if looks_like_flowchart_edge_syntax(&edge_line) {
+                        bail!("invalid flowchart edge syntax: {edge_line}");
+                    }
                 }
                 if added {
                     continue;
@@ -350,6 +438,10 @@ fn parse_flowchart(input: &str) -> Result<ParseOutput> {
 
             if add_flowchart_edge(&line, &mut graph, &subgraph_stack) {
                 continue;
+            }
+
+            if looks_like_flowchart_edge_syntax(&line) {
+                bail!("invalid flowchart edge syntax: {line}");
             }
 
             if let Some((node_id, node_label, node_shape, node_classes)) = parse_node_only(&line) {
@@ -2347,7 +2439,18 @@ fn extract_gantt_timing(details: &[String]) -> (Option<String>, Option<String>) 
 }
 
 fn requirement_kind_label(kind: &str) -> String {
-    let lower = kind.trim().to_ascii_lowercase();
+    let trimmed = kind.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "requirement" => return "Requirement".to_string(),
+        "functionalrequirement" => return "Functional Requirement".to_string(),
+        "interfacerequirement" => return "Interface Requirement".to_string(),
+        "performancerequirement" => return "Performance Requirement".to_string(),
+        "physicalrequirement" => return "Physical Requirement".to_string(),
+        "designconstraint" => return "Design Constraint".to_string(),
+        "element" => return "Element".to_string(),
+        _ => {}
+    }
     let mut chars = lower.chars();
     let Some(first) = chars.next() else {
         return String::new();
@@ -2376,26 +2479,61 @@ fn requirement_title_case(value: &str) -> String {
 
 fn normalize_requirement_attr(line: &str) -> String {
     let Some((key_raw, value_raw)) = line.split_once(':') else {
-        return line.trim().to_string();
+        return strip_quotes(line.trim());
     };
     let key = key_raw.trim().to_ascii_lowercase();
-    let value = value_raw.trim();
+    let value = strip_quotes(value_raw.trim());
     let pretty_key = match key.as_str() {
         "id" => "ID".to_string(),
         "text" => "Text".to_string(),
         "risk" => "Risk".to_string(),
         "verifymethod" | "verification" => "Verification".to_string(),
+        "docref" => "Doc Ref".to_string(),
         other => requirement_kind_label(other),
     };
     let pretty_value = match key.as_str() {
-        "risk" | "verifymethod" | "verification" => requirement_title_case(value),
-        _ => value.to_string(),
+        "risk" | "verifymethod" | "verification" => requirement_title_case(&value),
+        _ => value,
     };
     if pretty_value.is_empty() {
         pretty_key
     } else {
         format!("{pretty_key}: {pretty_value}")
     }
+}
+
+fn parse_requirement_header(header: &str) -> Option<(String, String, Vec<String>)> {
+    let trimmed = header.trim();
+    let mut split_at = None;
+    for (idx, ch) in trimmed.char_indices() {
+        if ch.is_whitespace() {
+            split_at = Some(idx);
+            break;
+        }
+    }
+    let split_at = split_at?;
+    let kind = trimmed[..split_at].trim();
+    let rest = trimmed[split_at..].trim();
+    if kind.is_empty() || rest.is_empty() {
+        return None;
+    }
+    let (id_raw, classes) = split_inline_classes(rest);
+    let id = strip_quotes(&id_raw);
+    if id.is_empty() {
+        return None;
+    }
+    Some((kind.to_string(), id, classes))
+}
+
+fn push_requirement_node(graph: &mut Graph, kind: &str, id: &str, classes: &[String]) {
+    let kind_label = requirement_kind_label(kind);
+    let label = if kind_label.is_empty() {
+        id.to_string()
+    } else {
+        format!("<<{}>>\n{}", kind_label, id)
+    };
+    graph.ensure_node(id, Some(label), Some(crate::ir::NodeShape::Rectangle));
+    apply_node_classes(graph, id, classes);
 }
 
 fn parse_requirement_diagram(input: &str) -> Result<ParseOutput> {
@@ -2414,6 +2552,26 @@ fn parse_requirement_diagram(input: &str) -> Result<ParseOutput> {
         }
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("requirementdiagram") {
+            continue;
+        }
+
+        if let Some(direction) = parse_direction_line(line) {
+            graph.direction = direction;
+            continue;
+        }
+
+        if line.starts_with("classDef") {
+            parse_class_def(line, &mut graph);
+            continue;
+        }
+
+        if line.starts_with("class ") {
+            parse_class_line(line, &mut graph);
+            continue;
+        }
+
+        if line.starts_with("style ") {
+            parse_style_line(line, &mut graph);
             continue;
         }
 
@@ -2439,6 +2597,7 @@ fn parse_requirement_diagram(input: &str) -> Result<ParseOutput> {
         if let Some((from, rel, to)) = parse_requirement_relation_line(line) {
             graph.ensure_node(&from, None, Some(crate::ir::NodeShape::Rectangle));
             graph.ensure_node(&to, None, Some(crate::ir::NodeShape::Rectangle));
+            let is_contains = rel == "contains";
             graph.edges.push(crate::ir::Edge {
                 from,
                 to,
@@ -2446,8 +2605,8 @@ fn parse_requirement_diagram(input: &str) -> Result<ParseOutput> {
                 start_label: None,
                 end_label: None,
                 directed: true,
-                arrow_start: false,
-                arrow_end: true,
+                arrow_start: is_contains,
+                arrow_end: !is_contains,
                 arrow_start_kind: None,
                 arrow_end_kind: None,
                 start_decoration: None,
@@ -2459,17 +2618,8 @@ fn parse_requirement_diagram(input: &str) -> Result<ParseOutput> {
 
         if let Some(open_idx) = line.find('{') {
             let header = line[..open_idx].trim();
-            let mut parts = header.split_whitespace();
-            let kind = parts.next().unwrap_or("").to_string();
-            let id = parts.next().unwrap_or("").to_string();
-            if !id.is_empty() {
-                let label = if kind.is_empty() {
-                    id.clone()
-                } else {
-                    let kind_label = requirement_kind_label(&kind);
-                    format!("<<{}>>\n{}", kind_label, id)
-                };
-                graph.ensure_node(&id, Some(label), Some(crate::ir::NodeShape::Rectangle));
+            if let Some((kind, id, classes)) = parse_requirement_header(header) {
+                push_requirement_node(&mut graph, &kind, &id, &classes);
                 current_id = Some(id.clone());
                 let tail = line[open_idx + 1..].trim();
                 if let Some(close_idx) = tail.find('}') {
@@ -2485,17 +2635,8 @@ fn parse_requirement_diagram(input: &str) -> Result<ParseOutput> {
             continue;
         }
 
-        let mut parts = line.split_whitespace();
-        let kind = parts.next().unwrap_or("");
-        let id = parts.next().unwrap_or("");
-        if !id.is_empty() {
-            let label = if kind.is_empty() {
-                id.to_string()
-            } else {
-                let kind_label = requirement_kind_label(kind);
-                format!("<<{}>>\n{}", kind_label, id)
-            };
-            graph.ensure_node(id, Some(label), Some(crate::ir::NodeShape::Rectangle));
+        if let Some((kind, id, classes)) = parse_requirement_header(line) {
+            push_requirement_node(&mut graph, &kind, &id, &classes);
         }
     }
 
@@ -2514,20 +2655,46 @@ fn parse_requirement_diagram(input: &str) -> Result<ParseOutput> {
 }
 
 fn parse_requirement_relation_line(line: &str) -> Option<(String, String, String)> {
-    let (left, right) = line.split_once("->")?;
-    let to = right.trim();
-    if to.is_empty() {
-        return None;
+    if let Some((left, right)) = line.split_once("->") {
+        let to = strip_quotes(right.trim());
+        let (from_part, rel_part) = left.trim().split_once('-')?;
+        let from = strip_quotes(from_part.trim());
+        let rel = normalize_requirement_relation(rel_part)?;
+        if from.is_empty() || to.is_empty() {
+            return None;
+        }
+        return Some((from, rel, to));
     }
-    let left = left.trim();
-    let (from_part, rel_part) = left.split_once('-')?;
-    let from = from_part.trim();
-    let rel = rel_part.trim().trim_matches('-').trim();
-    let rel_clean = rel.trim_start_matches('<').trim_end_matches('>').trim();
-    if from.is_empty() || rel_clean.is_empty() {
-        return None;
+
+    if let Some((left, right)) = line.split_once("<-") {
+        let to = strip_quotes(left.trim());
+        let (rel_part, from_part) = right.trim().split_once('-')?;
+        let from = strip_quotes(from_part.trim());
+        let rel = normalize_requirement_relation(rel_part)?;
+        if from.is_empty() || to.is_empty() {
+            return None;
+        }
+        return Some((from, rel, to));
     }
-    Some((from.to_string(), rel_clean.to_string(), to.to_string()))
+
+    None
+}
+
+fn normalize_requirement_relation(raw: &str) -> Option<String> {
+    let rel = raw
+        .trim()
+        .trim_matches('-')
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_ascii_lowercase();
+    match rel.as_str() {
+        "contains" | "copies" | "derives" | "satisfies" | "verifies" | "refines" | "traces" => {
+            Some(rel)
+        }
+        _ => None,
+    }
 }
 
 fn parse_gitgraph_diagram(input: &str) -> Result<ParseOutput> {
@@ -3895,18 +4062,33 @@ fn parse_architecture_diagram(input: &str) -> Result<ParseOutput> {
             }
             continue;
         }
-        if let Some((from, to)) = parse_architecture_edge(line) {
-            graph.ensure_node(&from, None, Some(crate::ir::NodeShape::Rectangle));
-            graph.ensure_node(&to, None, Some(crate::ir::NodeShape::Rectangle));
+        if lower.starts_with("junction ") {
+            if let Some((id, parent)) = parse_architecture_junction(line) {
+                graph.ensure_node(&id, Some(String::new()), Some(crate::ir::NodeShape::Circle));
+                if let Some(node) = graph.nodes.get_mut(&id) {
+                    node.icon = Some("junction".to_string());
+                }
+                if let Some(parent_id) = parent
+                    && let Some(idx) = groups.get(&parent_id).copied()
+                    && let Some(subgraph) = graph.subgraphs.get_mut(idx)
+                {
+                    subgraph.nodes.push(id.clone());
+                }
+            }
+            continue;
+        }
+        if let Some(edge_spec) = parse_architecture_edge(line) {
+            graph.ensure_node(&edge_spec.from, None, None);
+            graph.ensure_node(&edge_spec.to, None, None);
             graph.edges.push(crate::ir::Edge {
-                from,
-                to,
+                from: edge_spec.from,
+                to: edge_spec.to,
                 label: None,
                 start_label: None,
                 end_label: None,
-                directed: true,
-                arrow_start: false,
-                arrow_end: true,
+                directed: edge_spec.arrow_start || edge_spec.arrow_end,
+                arrow_start: edge_spec.arrow_start,
+                arrow_end: edge_spec.arrow_end,
                 arrow_start_kind: None,
                 arrow_end_kind: None,
                 start_decoration: None,
@@ -3917,6 +4099,14 @@ fn parse_architecture_diagram(input: &str) -> Result<ParseOutput> {
     }
 
     Ok(ParseOutput { graph, init_config })
+}
+
+#[derive(Debug, Clone)]
+struct ArchitectureEdgeSpec {
+    from: String,
+    to: String,
+    arrow_start: bool,
+    arrow_end: bool,
 }
 
 fn parse_architecture_node(
@@ -3960,9 +4150,33 @@ fn parse_architecture_node(
     Some((kind, id, label, parent, icon))
 }
 
-fn parse_architecture_edge(line: &str) -> Option<(String, String)> {
-    let arrows = ["-->", "--", "->"];
-    for arrow in &arrows {
+fn parse_architecture_junction(line: &str) -> Option<(String, Option<String>)> {
+    let rest = line.get("junction".len()..)?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let (id_part, parent) = if let Some((left, right)) = rest.split_once(" in ") {
+        (left.trim(), Some(right.trim().to_string()))
+    } else {
+        (rest, None)
+    };
+    let id = strip_quotes(id_part);
+    if id.is_empty() {
+        None
+    } else {
+        Some((id, parent))
+    }
+}
+
+fn parse_architecture_edge(line: &str) -> Option<ArchitectureEdgeSpec> {
+    let arrows = [
+        ("<-->", true, true),
+        ("<--", true, false),
+        ("-->", false, true),
+        ("--", false, false),
+        ("->", false, true),
+    ];
+    for (arrow, arrow_start, arrow_end) in arrows {
         if let Some(idx) = line.find(arrow) {
             let left = line[..idx].trim();
             let right = line[idx + arrow.len()..].trim();
@@ -3973,20 +4187,31 @@ fn parse_architecture_edge(line: &str) -> Option<(String, String)> {
             if from.is_empty() || to.is_empty() {
                 return None;
             }
-            return Some((from.to_string(), to.to_string()));
+            return Some(ArchitectureEdgeSpec {
+                from: from.to_string(),
+                to: to.to_string(),
+                arrow_start,
+                arrow_end,
+            });
         }
     }
     None
 }
 
+fn strip_arch_group_modifier(token: &str) -> &str {
+    token.trim().strip_suffix("{group}").unwrap_or(token).trim()
+}
+
 fn strip_arch_port_left(token: &str) -> &str {
     // "gateway:R" -> "gateway" (take the first part before ':')
-    token.split(':').next().unwrap_or(token).trim()
+    let id = token.split(':').next().unwrap_or(token).trim();
+    strip_arch_group_modifier(id)
 }
 
 fn strip_arch_port_right(token: &str) -> &str {
     // "L:app" -> "app" (take the last part after ':')
-    token.split(':').next_back().unwrap_or(token).trim()
+    let id = token.split(':').next_back().unwrap_or(token).trim();
+    strip_arch_group_modifier(id)
 }
 
 fn parse_radar_diagram(input: &str) -> Result<ParseOutput> {
@@ -5538,7 +5763,10 @@ fn parse_class_line(line: &str, graph: &mut Graph) {
     if parts.len() < 3 {
         return;
     }
-    let class_name = parts.last().unwrap().to_string();
+    let class_name = parts
+        .last()
+        .expect("parts.len() >= 3 checked above")
+        .to_string();
     let class_names: Vec<String> = class_name
         .split(',')
         .map(|name| name.trim().to_string())
@@ -6065,6 +6293,94 @@ A["foo & bar"] & B --> C"#;
     }
 
     #[test]
+    fn bare_edge_shorthand_is_still_accepted_as_flowchart() {
+        let parsed = parse_mermaid("A --> B").unwrap();
+        assert_eq!(parsed.graph.kind, DiagramKind::Flowchart);
+        assert_eq!(parsed.graph.edges.len(), 1);
+    }
+
+    #[test]
+    fn malformed_flowchart_edges_are_errors() {
+        for input in ["flowchart LR\nA-->\n", "flowchart LR\n-->B\n"] {
+            assert!(
+                parse_mermaid(input).is_err(),
+                "malformed edge should fail: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_non_mermaid_input_is_an_error() {
+        assert!(parse_mermaid("notMermaid\nA --> B").is_err());
+    }
+
+    #[test]
+    fn invalid_header_prefixes_are_not_accepted() {
+        for input in [
+            "piece of text\nA-->B",
+            "graphite LR\nA-->B",
+            "flowchartish LR\nA-->B",
+            "classDiagramExtra\nA-->B",
+            "sequenceDiagramExtra\nA->>B: hi",
+            "stateDiagramExtra\nA --> B",
+            "erDiagramExtra\nA ||--|| B : owns",
+            "quadrantChartExtra\nP: [0.5, 0.5]",
+            "blockbuster\nA --> B",
+            "c4not\nPerson(a, \"A\")",
+        ] {
+            assert!(
+                parse_mermaid(input).is_err(),
+                "invalid header accepted: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn beta_and_c4_headers_remain_accepted() {
+        for input in [
+            "stateDiagram-v2\nA --> B",
+            "xychart-beta\nx-axis [a]\nbar [1]",
+            "block-beta\nA --> B",
+            "C4Context\nPerson(a, \"A\")",
+            "pie showData\nA: 1",
+        ] {
+            assert!(
+                parse_mermaid(input).is_ok(),
+                "valid header rejected: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_init_directive_is_an_error() {
+        let err = parse_mermaid("%%{init: {invalid json}}%%\nflowchart LR\nA-->B")
+            .expect_err("invalid init directive should fail before rendering");
+        assert!(
+            err.to_string().contains("invalid Mermaid init directive"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn preprocess_keep_indent_skips_yaml_frontmatter() {
+        let input = "---\ntitle: Roadmap\ndisplayMode: compact\n---\nmindmap\n  root\n    child";
+        let (lines, init_config) = preprocess_input_keep_indent(input).unwrap();
+
+        assert_eq!(init_config, None);
+        assert_eq!(lines, vec!["mindmap", "  root", "    child"]);
+    }
+
+    #[test]
+    fn parse_indent_sensitive_diagram_with_frontmatter() {
+        let input = "---\ntitle: Roadmap\n---\nmindmap\n  root\n    child";
+        let parsed = parse_mermaid(input).unwrap();
+
+        assert_eq!(parsed.graph.kind, DiagramKind::Mindmap);
+        assert!(parsed.graph.nodes.contains_key("root"));
+        assert!(parsed.graph.nodes.contains_key("child"));
+    }
+
+    #[test]
     fn parse_subgraph() {
         let input = "flowchart TD\nsubgraph Group[\"My Group\"]\nA --> B\nend";
         let parsed = parse_mermaid(input).unwrap();
@@ -6464,6 +6780,26 @@ A["foo & bar"] & B --> C"#;
     }
 
     #[test]
+    fn indent_sensitive_diagrams_skip_yaml_frontmatter() {
+        for input in [
+            "---\ntitle: Hidden\n---\nmindmap\n  root\n    Child",
+            "---\ntitle: Hidden\n---\nkanban\n  Todo\n    [Task]",
+            "---\ntitle: Hidden\n---\ntreemap-beta\n  Root\n    Leaf: 1",
+        ] {
+            let parsed = parse_mermaid(input).unwrap();
+            assert!(
+                parsed.graph.nodes.values().all(|node| {
+                    !node.id.contains("Hidden")
+                        && !node.id.contains("title:")
+                        && !node.label.contains("Hidden")
+                        && !node.label.contains("title:")
+                }),
+                "frontmatter leaked into parsed nodes for {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_journey_basic() {
         let input = "journey\n  title My Journey\n  section Start\n    Step one: 5: Alice\n    Step two: 3: Alice, Bob";
         let parsed = parse_mermaid(input).unwrap();
@@ -6523,6 +6859,63 @@ A["foo & bar"] & B --> C"#;
         assert_eq!(parsed.graph.nodes.len(), 2);
         assert_eq!(parsed.graph.edges.len(), 1);
         assert_eq!(parsed.graph.edges[0].label.as_deref(), Some("satisfies"));
+    }
+
+    #[test]
+    fn parse_requirement_direction_and_reverse_relation() {
+        let input = r#"requirementDiagram
+  direction LR
+  requirement req1
+  element tester
+  req1 <- copies - tester"#;
+        let parsed = parse_mermaid(input).unwrap();
+        assert_eq!(parsed.graph.kind, DiagramKind::Requirement);
+        assert_eq!(parsed.graph.direction, crate::ir::Direction::LeftRight);
+        assert_eq!(parsed.graph.nodes.len(), 2);
+        assert!(!parsed.graph.nodes.contains_key("direction"));
+        assert_eq!(parsed.graph.edges.len(), 1);
+        let edge = &parsed.graph.edges[0];
+        assert_eq!(edge.from, "tester");
+        assert_eq!(edge.to, "req1");
+        assert_eq!(edge.label.as_deref(), Some("copies"));
+        assert!(!edge.arrow_start);
+        assert!(edge.arrow_end);
+    }
+
+    #[test]
+    fn parse_requirement_types_classes_styles_and_contains() {
+        let input = r##"requirementDiagram
+  classDef hot fill:#f00,stroke:#000,color:#fff
+  functionalRequirement req1:::hot {
+    id: "1.1"
+    text: "Quoted text"
+    risk: HIGH
+    verifyMethod: inspection
+  }
+  element webapp {
+    type: "application server"
+    docRef: "docs/reqs.md"
+  }
+  style webapp fill:#ffa,stroke:#333,color:#111
+  req1 - contains -> webapp"##;
+        let parsed = parse_mermaid(input).unwrap();
+        assert_eq!(parsed.graph.nodes.len(), 2);
+        let req = parsed.graph.nodes.get("req1").unwrap();
+        assert!(req.label.contains("<<Functional Requirement>>"));
+        assert!(req.label.contains("ID: 1.1"));
+        assert!(req.label.contains("Text: Quoted text"));
+        assert!(req.label.contains("Risk: High"));
+        assert!(req.label.contains("Verification: Inspection"));
+        let element = parsed.graph.nodes.get("webapp").unwrap();
+        assert!(element.label.contains("<<Element>>"));
+        assert!(element.label.contains("Type: application server"));
+        assert!(element.label.contains("Doc Ref: docs/reqs.md"));
+        assert!(parsed.graph.node_classes["req1"].contains(&"hot".to_string()));
+        assert!(parsed.graph.node_styles.contains_key("webapp"));
+        let edge = &parsed.graph.edges[0];
+        assert_eq!(edge.label.as_deref(), Some("contains"));
+        assert!(edge.arrow_start);
+        assert!(!edge.arrow_end);
     }
 
     #[test]

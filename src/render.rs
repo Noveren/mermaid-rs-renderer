@@ -45,23 +45,15 @@ fn edge_dom_id(edge_idx: usize) -> String {
 }
 
 /// How many pixels the arrowhead marker penetrates past the path endpoint.
-/// Must stay in sync with the `<marker>` definitions in [`render_svg`].
 ///
-/// - `OpenTriangle`: refX=1, base at x=18 -> 17 px
-/// - `ClassDependency`: refX=13, shape max x=18 -> 5 px
-/// - Generic: viewBox 10, markerWidth 8, refX=5 -> (10-5)*(8/10) = 4 px
+/// Kept as a public rendering helper for compatibility. The source of truth now
+/// lives in `edge_geometry`, so layout routing and SVG marker rendering cannot
+/// drift independently.
 pub fn arrowhead_inset(
     kind: crate::ir::DiagramKind,
     arrow_kind: Option<crate::ir::EdgeArrowhead>,
 ) -> f32 {
-    match kind {
-        crate::ir::DiagramKind::Class => match arrow_kind {
-            Some(crate::ir::EdgeArrowhead::OpenTriangle) => 17.0,
-            Some(crate::ir::EdgeArrowhead::ClassDependency) => 5.0,
-            None => 4.0,
-        },
-        _ => 0.0,
-    }
+    crate::edge_geometry::arrowhead_inset(kind, arrow_kind)
 }
 
 const SEQUENCE_VIEWBOX_PAD_LEFT: f32 = 50.0;
@@ -70,6 +62,15 @@ const SEQUENCE_VIEWBOX_PAD_TOP: f32 = 10.0;
 const SEQUENCE_VIEWBOX_PAD_BOTTOM: f32 = 11.0;
 
 pub fn render_svg(layout: &Layout, theme: &Theme, config: &LayoutConfig) -> String {
+    render_svg_with_dimensions(layout, theme, config, None)
+}
+
+pub fn render_svg_with_dimensions(
+    layout: &Layout,
+    theme: &Theme,
+    config: &LayoutConfig,
+    dimensions: Option<(f32, f32)>,
+) -> String {
     let mut svg = String::new();
     let state_font_size = if layout.kind == crate::ir::DiagramKind::State {
         theme.font_size * 0.85
@@ -181,8 +182,17 @@ pub fn render_svg(layout: &Layout, theme: &Theme, config: &LayoutConfig) -> Stri
     let preferred_ratio = config
         .preferred_aspect_ratio
         .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
-    let (target_width, target_height) =
+    let (mut target_width, mut target_height) =
         fit_dimensions_to_preferred_ratio(width, height, preferred_ratio);
+    if let Some((width, height)) = dimensions
+        && width.is_finite()
+        && height.is_finite()
+        && width > 0.0
+        && height > 0.0
+    {
+        target_width = width;
+        target_height = height;
+    }
 
     let mut width_attr = target_width.to_string();
     let mut height_attr = target_height.to_string();
@@ -190,7 +200,7 @@ pub fn render_svg(layout: &Layout, theme: &Theme, config: &LayoutConfig) -> Stri
     let preferred_ratio_style = preferred_ratio
         .map(|ratio| format!("aspect-ratio: {:.6};", ratio))
         .unwrap_or_default();
-    if !matches!(layout.diagram, DiagramData::Error(_)) {
+    if dimensions.is_none() && !matches!(layout.diagram, DiagramData::Error(_)) {
         if let DiagramData::C4(c4) = &layout.diagram {
             if c4.use_max_width {
                 width_attr = "100%".to_string();
@@ -969,7 +979,11 @@ pub fn render_svg(layout: &Layout, theme: &Theme, config: &LayoutConfig) -> Stri
             _ => 2.0,
         };
         for (edge_idx, edge) in layout.edges.iter().enumerate() {
-            let d = points_to_path(&edge.points);
+            let d = if layout.kind == crate::ir::DiagramKind::Mindmap && edge.points.len() > 2 {
+                basis_curve_path(&edge.points)
+            } else {
+                points_to_path(&edge.points)
+            };
             let mut stroke = theme.line_color.clone();
             let edge_id = edge_dom_id(edge_idx);
             let (mut dash, mut stroke_width) = match edge.style {
@@ -1565,6 +1579,70 @@ fn points_to_path(points: &[(f32, f32)]) -> String {
     for (x, y) in deduped.iter().skip(1) {
         d.push_str(&format!(" L {:.3},{:.3}", x, y));
     }
+    d
+}
+
+/// Port of d3's `curveBasis` (open uniform cubic B-spline). Given control
+/// points `P0..Pn-1`, emits an SVG path that mirrors d3's output exactly:
+/// `M P0` → `L (5*P0 + P1)/6` → `C (2*Pi-1+Pi)/3, (Pi-1+2*Pi)/3, (Pi-1+4*Pi+Pi+1)/6`
+/// for the interior, finishing with a closing cubic to `(Pn-2 + 5*Pn-1)/6`
+/// and a `L Pn-1`. Used by tidy-tree / lr-tree mindmap edges to match the
+/// curved style Mermaid JS produces.
+fn basis_curve_path(points: &[(f32, f32)]) -> String {
+    let pts = dedupe_points(points);
+    let n = pts.len();
+    if n == 0 {
+        return String::new();
+    }
+    if n == 1 {
+        return format!("M {:.3},{:.3}", pts[0].0, pts[0].1);
+    }
+    if n == 2 {
+        return format!(
+            "M {:.3},{:.3} L {:.3},{:.3}",
+            pts[0].0, pts[0].1, pts[1].0, pts[1].1
+        );
+    }
+    let mut d = format!("M {:.3},{:.3}", pts[0].0, pts[0].1);
+    let p0 = pts[0];
+    let p1 = pts[1];
+    d.push_str(&format!(
+        " L {:.3},{:.3}",
+        (5.0 * p0.0 + p1.0) / 6.0,
+        (5.0 * p0.1 + p1.1) / 6.0
+    ));
+    let mut x0 = p0.0;
+    let mut y0 = p0.1;
+    let mut x1 = p1.0;
+    let mut y1 = p1.1;
+    for i in 2..n {
+        let (x, y) = pts[i];
+        d.push_str(&format!(
+            " C {:.3},{:.3} {:.3},{:.3} {:.3},{:.3}",
+            (2.0 * x0 + x1) / 3.0,
+            (2.0 * y0 + y1) / 3.0,
+            (x0 + 2.0 * x1) / 3.0,
+            (y0 + 2.0 * y1) / 3.0,
+            (x0 + 4.0 * x1 + x) / 6.0,
+            (y0 + 4.0 * y1 + y) / 6.0
+        ));
+        x0 = x1;
+        y0 = y1;
+        x1 = x;
+        y1 = y;
+    }
+    // Closing segment, matching d3's lineEnd for `case 3`: another cubic
+    // pretending the final point is repeated, then a straight line to it.
+    d.push_str(&format!(
+        " C {:.3},{:.3} {:.3},{:.3} {:.3},{:.3}",
+        (2.0 * x0 + x1) / 3.0,
+        (2.0 * y0 + y1) / 3.0,
+        (x0 + 2.0 * x1) / 3.0,
+        (y0 + 2.0 * y1) / 3.0,
+        (x0 + 5.0 * x1) / 6.0,
+        (y0 + 5.0 * y1) / 6.0
+    ));
+    d.push_str(&format!(" L {:.3},{:.3}", x1, y1));
     d
 }
 
@@ -2457,8 +2535,9 @@ fn architecture_icon_svg(icon_type: Option<&str>, w: f32, h: f32, fill: &str) ->
         "fill=\"none\" stroke=\"{}\" stroke-width=\"{:.1}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"",
         fill, sw
     );
-    match icon_type {
-        Some("internet") | Some("globe") => {
+    let icon = icon_type.unwrap_or_default().to_ascii_lowercase();
+    match icon.as_str() {
+        "internet" | "globe" => {
             // Globe: circle + vertical ellipse + horizontal line + vertical line
             format!(
                 "<circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{r:.1}\" {style}/>\
@@ -2472,7 +2551,20 @@ fn architecture_icon_svg(icon_type: Option<&str>, w: f32, h: f32, fill: &str) ->
                 y2 = cy + r,
             )
         }
-        Some("server") => {
+        name if name.contains("internet")
+            || name.contains("gateway")
+            || name.contains("api-gateway") =>
+        {
+            format!(
+                "<circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{r:.1}\" {style}/>\
+                 <ellipse cx=\"{cx:.1}\" cy=\"{cy:.1}\" rx=\"{rx:.1}\" ry=\"{r:.1}\" {style}/>\
+                 <line x1=\"{x1:.1}\" y1=\"{cy:.1}\" x2=\"{x2:.1}\" y2=\"{cy:.1}\" {style}/>",
+                rx = r * 0.5,
+                x1 = cx - r,
+                x2 = cx + r,
+            )
+        }
+        "server" => {
             // Server rack: stacked rectangles
             let bx = cx - r;
             let by = cy - r;
@@ -2496,7 +2588,29 @@ fn architecture_icon_svg(icon_type: Option<&str>, w: f32, h: f32, fill: &str) ->
             }
             s
         }
-        Some("database") | Some("disk") => {
+        name if name.contains("server") || name.contains("ec2") || name.contains("compute") => {
+            let bx = cx - r;
+            let by = cy - r;
+            let bw = r * 2.0;
+            let bh = r * 2.0;
+            let rows = 3;
+            let row_h = bh / rows as f32;
+            let mut s = String::new();
+            for i in 0..rows {
+                let ry = by + i as f32 * row_h;
+                s.push_str(&format!(
+                    "<rect x=\"{bx:.1}\" y=\"{ry:.1}\" width=\"{bw:.1}\" height=\"{row_h:.1}\" rx=\"2\" {style}/>"
+                ));
+                let dot_x = bx + bw - row_h * 0.35;
+                let dot_y = ry + row_h * 0.5;
+                let dot_r = row_h * 0.12;
+                s.push_str(&format!(
+                    "<circle cx=\"{dot_x:.1}\" cy=\"{dot_y:.1}\" r=\"{dot_r:.1}\" fill=\"{fill}\" stroke=\"none\"/>"
+                ));
+            }
+            s
+        }
+        "database" | "disk" => {
             // Database cylinder: rect body + ellipses top/bottom
             let bx = cx - r;
             let bw = r * 2.0;
@@ -2514,7 +2628,29 @@ fn architecture_icon_svg(icon_type: Option<&str>, w: f32, h: f32, fill: &str) ->
                 x2 = bx + bw,
             )
         }
-        Some("cloud") => {
+        name if name.contains("database")
+            || name.contains("aurora")
+            || name.contains("rds")
+            || name.contains("dynamodb")
+            || name.contains("db")
+            || name.contains("disk")
+            || name.contains("storage")
+            || name.contains("s3")
+            || name.contains("glacier") =>
+        {
+            let bx = cx - r;
+            let bw = r * 2.0;
+            let ell_ry = r * 0.3;
+            let body_top = cy - r + ell_ry;
+            let body_bot = cy + r - ell_ry;
+            let body_h = body_bot - body_top;
+            format!(
+                "<rect x=\"{bx:.1}\" y=\"{body_top:.1}\" width=\"{bw:.1}\" height=\"{body_h:.1}\" {style}/>\
+                 <ellipse cx=\"{cx:.1}\" cy=\"{body_top:.1}\" rx=\"{r:.1}\" ry=\"{ell_ry:.1}\" {style}/>\
+                 <ellipse cx=\"{cx:.1}\" cy=\"{body_bot:.1}\" rx=\"{r:.1}\" ry=\"{ell_ry:.1}\" {style}/>",
+            )
+        }
+        "cloud" => {
             // Cloud: rounded bumpy shape using cubic bezier
             let s = r * 0.7;
             format!(
@@ -2530,12 +2666,44 @@ fn architecture_icon_svg(icon_type: Option<&str>, w: f32, h: f32, fill: &str) ->
                 y_bot = cy + s * 0.6,
             )
         }
-        _ => {
-            // Fallback: question mark
+        name if name.contains("cloud") => {
+            let s = r * 0.7;
             format!(
-                "<text x=\"{cx:.1}\" y=\"{y:.1}\" text-anchor=\"middle\" dominant-baseline=\"middle\" fill=\"{fill}\" font-size=\"{fs:.0}\">?</text>",
-                y = cy + w * 0.08,
-                fs = w * 0.7,
+                "<path d=\"M {x1:.1} {y_mid:.1} \
+                 Q {x1:.1} {y_top:.1} {cx:.1} {y_top:.1} \
+                 Q {x2:.1} {y_top:.1} {x2:.1} {y_mid:.1} \
+                 Q {x2:.1} {y_bot:.1} {cx:.1} {y_bot:.1} \
+                 Q {x1:.1} {y_bot:.1} {x1:.1} {y_mid:.1} Z\" {style}/>",
+                x1 = cx - s,
+                x2 = cx + s,
+                y_mid = cy,
+                y_top = cy - s * 0.8,
+                y_bot = cy + s * 0.6,
+            )
+        }
+        name if name.contains("lambda") => {
+            let fs = w * 0.72;
+            format!(
+                "<text x=\"{cx:.1}\" y=\"{cy:.1}\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"{fill}\" font-size=\"{fs:.0}\" font-family=\"serif\">λ</text>"
+            )
+        }
+        _ => {
+            // Generic registered Iconify/custom icon: draw a neutral component
+            // glyph instead of a question mark, so unknown icons are still a
+            // usable visual node rather than looking broken.
+            let s = r * 0.9;
+            let x = cx - s;
+            let y = cy - s;
+            let inner = s * 0.35;
+            format!(
+                "<rect x=\"{x:.1}\" y=\"{y:.1}\" width=\"{w2:.1}\" height=\"{w2:.1}\" rx=\"4\" {style}/>\
+                 <line x1=\"{x1:.1}\" y1=\"{cy:.1}\" x2=\"{x2:.1}\" y2=\"{cy:.1}\" {style}/>\
+                 <line x1=\"{cx:.1}\" y1=\"{y1:.1}\" x2=\"{cx:.1}\" y2=\"{y2:.1}\" {style}/>",
+                w2 = s * 2.0,
+                x1 = cx - inner,
+                x2 = cx + inner,
+                y1 = cy - inner,
+                y2 = cy + inner,
             )
         }
     }
@@ -2586,8 +2754,6 @@ fn render_architecture(
         if edge.points.len() < 2 {
             continue;
         }
-        let (x0, y0) = edge.points[0];
-        let (x1, y1) = edge.points[edge.points.len() - 1];
         let stroke = edge
             .override_style
             .stroke
@@ -2601,15 +2767,23 @@ fn render_architecture(
             .as_ref()
             .map(|dash| format!(" stroke-dasharray=\"{}\"", dash))
             .unwrap_or_default();
+        let marker_start = if edge.arrow_start {
+            format!(" marker-start=\"url(#arrow-start-{marker_idx})\"")
+        } else {
+            String::new()
+        };
+        let marker_end = if edge.arrow_end {
+            format!(" marker-end=\"url(#arrow-{marker_idx})\"")
+        } else {
+            String::new()
+        };
         svg.push_str(&format!(
-            "<path d=\"M {:.3} {:.3} L {:.3} {:.3}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" marker-end=\"url(#arrow-{})\"{} />",
-            x0,
-            y0,
-            x1,
-            y1,
+            "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\"{}{}{} />",
+            points_to_path(&edge.points),
             escape_xml(stroke),
             stroke_width,
-            marker_idx,
+            marker_start,
+            marker_end,
             dash_attr,
         ));
     }
@@ -2620,6 +2794,9 @@ fn render_architecture(
         if node.hidden {
             continue;
         }
+        let is_junction = node.icon.as_deref() == Some("junction")
+            || (node.shape == crate::ir::NodeShape::Circle
+                && node.label.lines.iter().all(|line| line.trim().is_empty()));
         let icon_fill = node.style.fill.as_deref().unwrap_or(ICON_FILL);
         let label_text = node
             .label
@@ -2635,6 +2812,17 @@ fn render_architecture(
             node.x,
             node.y
         ));
+        if is_junction {
+            svg.push_str(&format!(
+                "<circle cx=\"{:.3}\" cy=\"{:.3}\" r=\"{:.3}\" fill=\"{}\" stroke=\"none\" />",
+                node.width / 2.0,
+                node.height / 2.0,
+                node.width.min(node.height) / 2.0,
+                escape_xml(icon_fill)
+            ));
+            svg.push_str("</g>");
+            continue;
+        }
         svg.push_str(&format!(
             "<rect width=\"{}\" height=\"{}\" fill=\"{}\" stroke=\"none\" />",
             node.width,
